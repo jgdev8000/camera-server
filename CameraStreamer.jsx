@@ -13,9 +13,10 @@ const CameraStreamer = ({ serverUrl = 'http://localhost:8004' }) => {
   const [cameras, setCameras] = useState([]);
   const [selectedId, setSelectedId] = useState(null);
   const [info, setInfo] = useState(null);
-  const [control, setControl] = useState({ exposure: null, gain: null });
+  const [control, setControl] = useState({ exposure: null, gain: null, acquire: null });
   const [exposureInput, setExposureInput] = useState('');
   const [gainInput, setGainInput] = useState('');
+  const [isToggling, setIsToggling] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState(null);
   const [isApplying, setIsApplying] = useState(false);
@@ -91,7 +92,7 @@ const CameraStreamer = ({ serverUrl = 'http://localhost:8004' }) => {
   useEffect(() => {
     if (!selectedId) {
       setInfo(null);
-      setControl({ exposure: null, gain: null });
+      setControl({ exposure: null, gain: null, acquire: null });
       return;
     }
     fetchInfo(selectedId);
@@ -117,6 +118,25 @@ const CameraStreamer = ({ serverUrl = 'http://localhost:8004' }) => {
       setLastSnapshotTime(new Date().toLocaleTimeString());
     } catch (err) {
       setError(`Snapshot error: ${err.message}`);
+    }
+  };
+
+  const handleToggleAcquire = async () => {
+    if (!selectedId || control.acquire === null) return;
+    setIsToggling(true);
+    try {
+      const res = await fetch(`${serverUrl}/cameras/${selectedId}/control`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ acquire: !control.acquire }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      setControl(data.current);
+    } catch (err) {
+      setError(`Acquire toggle failed: ${err.message}`);
+    } finally {
+      setIsToggling(false);
     }
   };
 
@@ -235,6 +255,24 @@ const CameraStreamer = ({ serverUrl = 'http://localhost:8004' }) => {
                 RBV: {control.gain != null ? control.gain.toFixed(2) : '—'}
               </div>
               <button
+                onClick={handleToggleAcquire}
+                disabled={isToggling || control.acquire === null}
+                style={{
+                  ...styles.button,
+                  ...(control.acquire ? styles.stopButton : styles.startButton),
+                  opacity: (isToggling || control.acquire === null) ? 0.6 : 1,
+                  cursor: (isToggling || control.acquire === null) ? 'not-allowed' : 'pointer',
+                }}
+              >
+                {isToggling
+                  ? '…'
+                  : control.acquire === null
+                    ? 'Acquire: —'
+                    : control.acquire
+                      ? '■ Stop acquiring'
+                      : '▶ Start acquiring'}
+              </button>
+              <button
                 onClick={handleApplyControl}
                 disabled={isApplying}
                 style={{
@@ -244,7 +282,7 @@ const CameraStreamer = ({ serverUrl = 'http://localhost:8004' }) => {
                   cursor: isApplying ? 'not-allowed' : 'pointer',
                 }}
               >
-                {isApplying ? 'Applying…' : 'Apply'}
+                {isApplying ? 'Applying…' : 'Apply exposure / gain'}
               </button>
               <button
                 onClick={handleSnapshot}
@@ -377,8 +415,10 @@ const styles = {
     padding: '10px 14px', borderRadius: '6px', border: 'none',
     fontSize: '14px', fontWeight: '600', cursor: 'pointer',
   },
-  applyButton: { backgroundColor: '#10b981', color: 'white' },
-  snapshotButton: { backgroundColor: '#3b82f6', color: 'white' },
+  applyButton: { backgroundColor: '#3b82f6', color: 'white' },
+  startButton: { backgroundColor: '#10b981', color: 'white' },
+  stopButton: { backgroundColor: '#ef4444', color: 'white' },
+  snapshotButton: { backgroundColor: '#8b5cf6', color: 'white' },
   statusMessage: {
     padding: '8px 10px', backgroundColor: '#ecfdf5',
     border: '1px solid #a7f3d0', color: '#065f46',

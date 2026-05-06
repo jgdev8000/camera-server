@@ -25,7 +25,7 @@ import cv2
 import numpy as np
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
 try:
@@ -88,6 +88,7 @@ class CameraConfig(BaseModel):
 class ControlUpdate(BaseModel):
     exposure: Optional[float] = None
     gain: Optional[float] = None
+    acquire: Optional[bool] = None
 
 
 # ---------- camera stream ----------
@@ -183,10 +184,11 @@ class CameraStream:
 
     def read_control(self) -> dict:
         if not EPICS_AVAILABLE:
-            return {"exposure": None, "gain": None}
+            return {"exposure": None, "gain": None, "acquire": None}
         return {
             "exposure": _safe_caget(self.cfg.pv("cam1:AcquireTime_RBV")),
             "gain": _safe_caget(self.cfg.pv("cam1:Gain_RBV")),
+            "acquire": _safe_caget_bool(self.cfg.pv("cam1:Acquire")),
         }
 
     def set_control(self, update: ControlUpdate) -> dict:
@@ -203,6 +205,11 @@ class CameraStream:
             if ok != 1:
                 raise HTTPException(status_code=502, detail="caput Gain failed")
             applied["gain"] = update.gain
+        if update.acquire is not None:
+            ok = caput(self.cfg.pv("cam1:Acquire"), 1 if update.acquire else 0)
+            if ok != 1:
+                raise HTTPException(status_code=502, detail="caput Acquire failed")
+            applied["acquire"] = update.acquire
         return applied
 
 
@@ -210,6 +217,14 @@ def _safe_caget(pv: str):
     try:
         v = caget(pv, timeout=1.0)
         return float(v) if v is not None else None
+    except Exception:
+        return None
+
+
+def _safe_caget_bool(pv: str):
+    try:
+        v = caget(pv, timeout=1.0, as_string=False)
+        return bool(v) if v is not None else None
     except Exception:
         return None
 
@@ -362,11 +377,216 @@ def _info_payload(stream: CameraStream) -> dict:
             "width": cfg.pv("cam1:ArraySizeX_RBV"),
             "exposure": cfg.pv("cam1:AcquireTime"),
             "gain": cfg.pv("cam1:Gain"),
+            "acquire": cfg.pv("cam1:Acquire"),
         },
     }
 
 
+# ---------- landing page ----------
+
+LANDING_PAGE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>EPICS Camera Server</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+         background: #f8f9fa; margin: 0; padding: 24px; color: #1f2937; }
+  h1 { margin: 0 0 4px 0; font-size: 24px; }
+  .sub { color: #6b7280; font-size: 14px; margin-bottom: 24px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(420px, 1fr)); gap: 20px; }
+  .card { background: #fff; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+          overflow: hidden; display: flex; flex-direction: column; }
+  .card-header { display: flex; justify-content: space-between; align-items: center;
+                 padding: 12px 16px; border-bottom: 1px solid #e5e7eb; }
+  .card-title { font-weight: 600; font-size: 15px; }
+  .card-sub { color: #6b7280; font-size: 12px; }
+  .stream { width: 100%; aspect-ratio: 4/3; background: #000; object-fit: contain; display: block; }
+  .controls { padding: 12px 16px; display: grid; grid-template-columns: 1fr 1fr; gap: 8px 12px; }
+  .controls label { display: flex; flex-direction: column; gap: 2px; font-size: 12px; color: #4b5563; }
+  .controls input { padding: 6px 8px; font-size: 13px;
+                    border: 1px solid #d1d5db; border-radius: 4px; }
+  .rbv { font-size: 11px; color: #6b7280; }
+  .row { display: flex; gap: 8px; padding: 0 16px 16px 16px; }
+  button { flex: 1; padding: 8px 12px; border-radius: 4px; border: none;
+           font-size: 13px; font-weight: 600; cursor: pointer; color: #fff; }
+  .btn-acq-on  { background: #10b981; }
+  .btn-acq-off { background: #ef4444; }
+  .btn-apply   { background: #3b82f6; }
+  .btn-snap    { background: #8b5cf6; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 999px;
+           font-size: 11px; font-weight: 500; }
+  .badge-on  { background: #d1fae5; color: #065f46; }
+  .badge-off { background: #fee2e2; color: #991b1b; }
+  .badge-init { background: #fef3c7; color: #92400e; }
+  .empty { padding: 40px; text-align: center; color: #6b7280; background: #fff; border-radius: 8px; }
+  a { color: #3b82f6; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+<h1>EPICS Camera Server</h1>
+<div class="sub">
+  <span id="status">loading…</span> ·
+  <a href="/cameras">/cameras</a> · <a href="/health">/health</a> · <a href="/docs">API docs</a>
+</div>
+<div id="grid" class="grid"></div>
+
+<script>
+const fmt = (v, d = 4) => v == null ? "—" : Number(v).toFixed(d);
+
+async function fetchJSON(url, opts) {
+  const res = await fetch(url, opts);
+  if (!res.ok) throw new Error(`${url} → ${res.status}`);
+  return res.json();
+}
+
+async function refresh() {
+  try {
+    const [health, cams] = await Promise.all([
+      fetchJSON("/health"),
+      fetchJSON("/cameras"),
+    ]);
+    document.getElementById("status").textContent =
+      `${health.cameras.length} camera(s) · EPICS ${health.epics_available ? "available" : "demo"} · default ${health.default || "—"}`;
+    renderGrid(cams.cameras);
+  } catch (e) {
+    document.getElementById("status").textContent = "error: " + e.message;
+  }
+}
+
+function renderGrid(cameras) {
+  const grid = document.getElementById("grid");
+  if (cameras.length === 0) {
+    grid.innerHTML = '<div class="empty">No cameras configured. POST /cameras to add one.</div>';
+    return;
+  }
+  const ids = cameras.map(c => c.id);
+  // remove cards no longer present
+  Array.from(grid.children).forEach(card => {
+    if (!ids.includes(card.dataset.id)) card.remove();
+  });
+  for (const c of cameras) {
+    let card = grid.querySelector(`[data-id="${c.id}"]`);
+    if (!card) card = createCard(c, grid);
+    updateCardStatus(card, c);
+  }
+}
+
+function createCard(c, grid) {
+  const card = document.createElement("div");
+  card.className = "card";
+  card.dataset.id = c.id;
+  card.innerHTML = `
+    <div class="card-header">
+      <div>
+        <div class="card-title">${c.label}</div>
+        <div class="card-sub">${c.id} · ${c.type} · ${c.prefix}</div>
+      </div>
+      <span class="badge" data-role="status-badge">…</span>
+    </div>
+    <img class="stream" src="/cameras/${c.id}/stream" alt="${c.id}">
+    <div class="controls">
+      <label>Exposure (s)
+        <input type="number" step="0.001" min="0" data-role="exposure">
+        <span class="rbv" data-role="exposure-rbv">RBV: —</span>
+      </label>
+      <label>Gain
+        <input type="number" step="0.1" data-role="gain">
+        <span class="rbv" data-role="gain-rbv">RBV: —</span>
+      </label>
+    </div>
+    <div class="row">
+      <button class="btn-acq-off" data-role="acquire">…</button>
+      <button class="btn-apply"   data-role="apply">Apply</button>
+      <button class="btn-snap"    data-role="snap">Snapshot</button>
+    </div>`;
+  grid.appendChild(card);
+
+  card.querySelector('[data-role="apply"]').onclick = () => applyControl(c.id, card);
+  card.querySelector('[data-role="snap"]').onclick  = () => snapshot(c.id);
+  card.querySelector('[data-role="acquire"]').onclick = () => toggleAcquire(c.id, card);
+
+  refreshControl(c.id, card);
+  setInterval(() => refreshControl(c.id, card), 5000);
+  return card;
+}
+
+function updateCardStatus(card, c) {
+  const badge = card.querySelector('[data-role="status-badge"]');
+  badge.className = "badge " + (c.status === "connected" ? "badge-on" : "badge-init");
+  badge.textContent = c.status + (c.is_default ? " · default" : "");
+}
+
+async function refreshControl(id, card) {
+  try {
+    const ctrl = await fetchJSON(`/cameras/${id}/control`);
+    card.querySelector('[data-role="exposure-rbv"]').textContent = "RBV: " + fmt(ctrl.exposure);
+    card.querySelector('[data-role="gain-rbv"]').textContent     = "RBV: " + fmt(ctrl.gain, 2);
+    const expIn  = card.querySelector('[data-role="exposure"]');
+    const gainIn = card.querySelector('[data-role="gain"]');
+    if (document.activeElement !== expIn  && ctrl.exposure != null) expIn.value  = ctrl.exposure;
+    if (document.activeElement !== gainIn && ctrl.gain     != null) gainIn.value = ctrl.gain;
+    const btn = card.querySelector('[data-role="acquire"]');
+    if (ctrl.acquire) {
+      btn.textContent = "Stop";
+      btn.className = "btn-acq-off";
+    } else {
+      btn.textContent = "Start";
+      btn.className = "btn-acq-on";
+    }
+  } catch (_) { /* IOC may be down */ }
+}
+
+async function applyControl(id, card) {
+  const body = {};
+  const exp  = card.querySelector('[data-role="exposure"]').value;
+  const gain = card.querySelector('[data-role="gain"]').value;
+  if (exp  !== "") body.exposure = Number(exp);
+  if (gain !== "") body.gain     = Number(gain);
+  if (Object.keys(body).length === 0) return;
+  try {
+    await fetchJSON(`/cameras/${id}/control`, {
+      method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    refreshControl(id, card);
+  } catch (e) { alert("Apply failed: " + e.message); }
+}
+
+async function toggleAcquire(id, card) {
+  const btn = card.querySelector('[data-role="acquire"]');
+  const turningOn = btn.textContent === "Start";
+  try {
+    await fetchJSON(`/cameras/${id}/control`, {
+      method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ acquire: turningOn }),
+    });
+    refreshControl(id, card);
+  } catch (e) { alert("Acquire failed: " + e.message); }
+}
+
+function snapshot(id) {
+  const a = document.createElement("a");
+  a.href = `/cameras/${id}/snapshot`;
+  a.download = `${id}-${Date.now()}.jpg`;
+  document.body.appendChild(a); a.click(); a.remove();
+}
+
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>
+"""
+
+
 # ---------- multi-camera endpoints ----------
+
+@app.get("/", response_class=HTMLResponse)
+async def landing():
+    return LANDING_PAGE
+
 
 @app.get("/health")
 async def health():

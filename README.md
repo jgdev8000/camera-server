@@ -47,6 +47,9 @@ The server binds to whichever local interface is in `192.168.1.0/24` (currently
 `192.168.1.50`) on port `8004`. Override with `HOST=0.0.0.0` or
 `CAMERA_SERVER_SUBNET=10.0.0.0/24` env vars.
 
+Open **`http://192.168.1.50:8004/`** for the dashboard — live thumbnails of
+every camera, with start/stop, exposure/gain, and snapshot controls per camera.
+
 ## Files
 
 | File | Purpose |
@@ -102,6 +105,7 @@ PVs derived from prefix:
 | Width / height RBV | `{prefix}cam1:ArraySizeX_RBV` / `cam1:ArraySizeY_RBV` |
 | Exposure (set / RBV) | `{prefix}cam1:AcquireTime` / `cam1:AcquireTime_RBV` |
 | Gain (set / RBV) | `{prefix}cam1:Gain` / `cam1:Gain_RBV` |
+| Acquire start/stop | `{prefix}cam1:Acquire` (1 = start, 0 = stop) |
 
 `POST /cameras` and `DELETE /cameras/{id}` rewrite `cameras.json` atomically.
 Editing the file by hand requires a server restart to take effect.
@@ -112,6 +116,7 @@ Editing the file by hand requires a server restart to take effect.
 
 | Method | Path | Purpose |
 |---|---|---|
+| `GET` | `/` | HTML dashboard: live thumbnails, acquire toggle, exposure/gain per camera |
 | `GET` | `/health` | Server status, EPICS availability, default id, per-camera summary |
 | `GET` | `/cameras` | List configured cameras with status |
 | `POST` | `/cameras` | Add a camera (body = config object). 409 on duplicate id |
@@ -120,8 +125,8 @@ Editing the file by hand requires a server restart to take effect.
 | `GET` | `/cameras/{id}/stream` | MJPEG stream |
 | `GET` | `/cameras/{id}/snapshot` | One JPEG frame |
 | `GET` | `/cameras/{id}/snapshot.png` | One PNG frame |
-| `GET` | `/cameras/{id}/control` | `{exposure, gain}` from RBV PVs |
-| `PUT` | `/cameras/{id}/control` | Body `{exposure?: float, gain?: float}` → caput |
+| `GET` | `/cameras/{id}/control` | `{exposure, gain, acquire}` from RBV PVs |
+| `PUT` | `/cameras/{id}/control` | Body `{exposure?: float, gain?: float, acquire?: bool}` → caput |
 
 ### Legacy aliases (default camera)
 
@@ -135,10 +140,15 @@ Editing the file by hand requires a server restart to take effect.
 curl http://192.168.1.50:8004/health | jq
 curl http://192.168.1.50:8004/cameras | jq
 
-# read & set exposure
+# read & set exposure / gain / acquire
 curl http://192.168.1.50:8004/cameras/basler1/control | jq
 curl -X PUT -H 'Content-Type: application/json' \
-  -d '{"exposure":0.05,"gain":1.0}' \
+  -d '{"exposure":0.05,"gain":1.0,"acquire":true}' \
+  http://192.168.1.50:8004/cameras/basler1/control | jq
+
+# stop acquisition only
+curl -X PUT -H 'Content-Type: application/json' \
+  -d '{"acquire":false}' \
   http://192.168.1.50:8004/cameras/basler1/control | jq
 
 # snapshot & stream
