@@ -13,7 +13,6 @@ import ipaddress
 import json
 import logging
 import os
-import queue
 import socket
 import threading
 import time
@@ -29,11 +28,11 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
 try:
-    from epics import caget, caput
+    from epics import PV, caget, caput
     EPICS_AVAILABLE = True
 except ImportError:
     EPICS_AVAILABLE = False
-    caget = caput = None
+    PV = caget = caput = None
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -101,70 +100,82 @@ class ControlUpdate(BaseModel):
 class CameraStream:
     def __init__(self, cfg: CameraConfig):
         self.cfg = cfg
-        self.frame_queue: queue.Queue = queue.Queue(maxsize=2)
         self.running = False
         self.current_frame: Optional[np.ndarray] = None
+        self.frame_counter = 0  # incremented on every new frame; lets MJPEG generators wait without polling
         self.lock = threading.Lock()
-        self.capture_thread: Optional[threading.Thread] = None
+        self._last_live_frame_at = 0.0
+        self._pv_image: Optional["PV"] = None
+        self._pv_y: Optional["PV"] = None
+        self._pv_x: Optional["PV"] = None
+        self._demo_thread: Optional[threading.Thread] = None
 
     def start(self) -> None:
         if self.running:
             return
         self.running = True
-        self.capture_thread = threading.Thread(
-            target=self._capture_loop, daemon=True, name=f"camera-{self.cfg.id}"
+        if EPICS_AVAILABLE:
+            self._pv_image = PV(self.cfg.pv("image1:ArrayData"),
+                                auto_monitor=True, callback=self._on_frame)
+            self._pv_y = PV(self.cfg.pv("cam1:ArraySizeY_RBV"), auto_monitor=True)
+            self._pv_x = PV(self.cfg.pv("cam1:ArraySizeX_RBV"), auto_monitor=True)
+        self._demo_thread = threading.Thread(
+            target=self._demo_fallback_loop, daemon=True, name=f"camera-{self.cfg.id}-demo"
         )
-        self.capture_thread.start()
-        logger.info("Camera %s started (prefix=%s)", self.cfg.id, self.cfg.prefix)
+        self._demo_thread.start()
+        logger.info("Camera %s started (prefix=%s, monitor=%s)",
+                    self.cfg.id, self.cfg.prefix, EPICS_AVAILABLE)
 
     def stop(self) -> None:
         self.running = False
+        for pv in (self._pv_image, self._pv_y, self._pv_x):
+            if pv is not None:
+                try:
+                    pv.disconnect()
+                except Exception:
+                    pass
+        self._pv_image = self._pv_y = self._pv_x = None
         logger.info("Camera %s stopped", self.cfg.id)
 
-    def _capture_loop(self) -> None:
-        period = 1.0 / self.cfg.fps
-        while self.running:
-            try:
-                frame = self._read_epics_frame() if EPICS_AVAILABLE else None
-                if frame is None:
-                    frame = self._demo_frame()
-
-                frame = cv2.resize(frame, (self.cfg.width, self.cfg.height))
-                with self.lock:
-                    self.current_frame = frame.copy()
-                try:
-                    self.frame_queue.put_nowait(frame)
-                except queue.Full:
-                    pass
-
-                time.sleep(period)
-            except Exception as e:
-                logger.error("Camera %s capture error: %s", self.cfg.id, e)
-                time.sleep(1)
-
-    def _read_epics_frame(self) -> Optional[np.ndarray]:
+    def _on_frame(self, value=None, **_kw) -> None:
+        # called by pyepics monitor thread on every new image post — keep it lean
+        if value is None or getattr(value, "size", 0) == 0:
+            return
         try:
-            data = caget(self.cfg.pv("image1:ArrayData"))
-            if data is None or data.size == 0:
-                return None
-            h = caget(self.cfg.pv("cam1:ArraySizeY_RBV"))
-            w = caget(self.cfg.pv("cam1:ArraySizeX_RBV"))
+            h = self._pv_y.value if self._pv_y is not None else None
+            w = self._pv_x.value if self._pv_x is not None else None
             if not (h and w and int(h) > 0 and int(w) > 0):
-                return None  # IOC up but camera not acquiring yet
-            if len(data.shape) == 1:
-                if data.size < int(h) * int(w):
-                    return None
-                frame = data[: int(h) * int(w)].reshape((int(h), int(w)))
+                return  # IOC up but camera not acquiring yet
+            ih, iw = int(h), int(w)
+            data = value
+            if data.ndim == 1:
+                if data.size < ih * iw:
+                    return
+                frame = data[: ih * iw].reshape((ih, iw))
             else:
                 frame = data
             if frame.dtype != np.uint8:
                 frame = np.uint8(frame)
-            if len(frame.shape) == 2:
+            if frame.ndim == 2:
                 frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-            return frame
+            frame = cv2.resize(frame, (self.cfg.width, self.cfg.height))
+            with self.lock:
+                self.current_frame = frame
+                self._last_live_frame_at = time.time()
+                self.frame_counter += 1
         except Exception as e:
-            logger.debug("Camera %s caget failed: %s", self.cfg.id, e)
-            return None
+            logger.debug("Camera %s on_frame error: %s", self.cfg.id, e)
+
+    def _demo_fallback_loop(self) -> None:
+        # produces demo frames only when no live frame has arrived recently
+        period = max(0.1, 1.0 / self.cfg.fps)
+        while self.running:
+            time.sleep(period)
+            if time.time() - self._last_live_frame_at < 1.0:
+                continue
+            with self.lock:
+                self.current_frame = self._demo_frame()
+                self.frame_counter += 1
 
     def _demo_frame(self) -> np.ndarray:
         t = int(time.time() * 100) % 256
@@ -182,8 +193,16 @@ class CameraStream:
         with self.lock:
             return self.current_frame.copy() if self.current_frame is not None else None
 
+    def get_frame_if_newer(self, last_seen: int):
+        """Return (frame, frame_counter) if a new frame is available, else (None, last_seen)."""
+        with self.lock:
+            if self.frame_counter == last_seen:
+                return None, last_seen
+            frame = self.current_frame.copy() if self.current_frame is not None else None
+            return frame, self.frame_counter
+
     def is_connected(self) -> bool:
-        return self.current_frame is not None
+        return time.time() - self._last_live_frame_at < 2.0
 
     # control
 
@@ -361,10 +380,11 @@ app.add_middleware(
 
 def _mjpeg_response(stream: CameraStream) -> StreamingResponse:
     async def gen():
+        last_seen = -1
         while stream.running:
-            frame = stream.get_frame()
+            frame, last_seen = stream.get_frame_if_newer(last_seen)
             if frame is None:
-                await asyncio.sleep(0.05)
+                await asyncio.sleep(0.005)
                 continue
             ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
             if ok:
@@ -372,7 +392,6 @@ def _mjpeg_response(stream: CameraStream) -> StreamingResponse:
                        b"Content-Type: image/jpeg\r\n"
                        b"Content-Length: " + str(len(buf)).encode() + b"\r\n\r\n"
                        + buf.tobytes() + b"\r\n")
-            await asyncio.sleep(1.0 / stream.cfg.fps)
 
     return StreamingResponse(gen(), media_type="multipart/x-mixed-replace; boundary=frame")
 
