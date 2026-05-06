@@ -1,0 +1,23 @@
+{
+  "default": "basler1",
+  "cameras": [
+    {
+      "id": "basler1",
+      "label": "Basler USB",
+      "type": "usb",
+      "prefix": "basler1:",
+      "fps": 12,
+      "width": 640,
+      "height": 480
+    },
+    {
+      "id": "gige1",
+      "label": "Basler GigE 1 (acA1920-25gm)",
+      "type": "gige",
+      "prefix": "gige1:",
+      "fps": 12,
+      "width": 640,
+      "height": 480
+    }
+  ]
+}

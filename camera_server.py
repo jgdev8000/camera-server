@@ -1,270 +1,313 @@
 #!/usr/bin/env python3
+"""Multi-camera FastAPI server for EPICS Basler cameras (USB and GigE).
+
+Reads images from EPICS PVs, serves MJPEG streams and snapshots, and exposes
+exposure / gain controls via caput. Cameras are configured in cameras.json
+and can be added or removed at runtime.
 """
-FastAPI server for EPICS Basler camera streaming and snapshots
-Streams video using H.264/H.265 and provides snapshot endpoints
-"""
+
+from __future__ import annotations
+
+import asyncio
+import ipaddress
+import json
+import logging
+import os
+import queue
+import socket
+import threading
+import time
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Literal, Optional
 
 import cv2
 import numpy as np
-import logging
-import io
-import threading
-import time
-import asyncio
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from contextlib import asynccontextmanager
-import subprocess
-from pathlib import Path
-import queue
+from pydantic import BaseModel, Field, field_validator
 
-# Try to import pyepics for EPICS PV reading
 try:
-    from epics import caget
+    from epics import caget, caput
     EPICS_AVAILABLE = True
 except ImportError:
     EPICS_AVAILABLE = False
-    print("Warning: pyepics not installed. Install with: pip install pyepics")
+    caget = caput = None
 
-# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Configuration
-EPICS_IMAGE_PV = "basler1:image1:ArrayData"  # Image data array
-EPICS_HEIGHT_PV = "basler1:cam1:ArraySizeY_RBV"  # Height PV
-EPICS_WIDTH_PV = "basler1:cam1:ArraySizeX_RBV"    # Width PV
-STREAM_FPS = 12
-STREAM_BITRATE = "2M"
-CODEC = "h264"  # or "h265" for HEVC
-OUTPUT_WIDTH = 640  # Medium resolution
-OUTPUT_HEIGHT = 480
+CONFIG_PATH = Path(os.environ.get("CAMERAS_CONFIG", Path(__file__).parent / "cameras.json"))
 
+# Bind to the host's interface on the camera subnet by default. Override with HOST env var.
+BIND_SUBNET = os.environ.get("CAMERA_SERVER_SUBNET", "192.168.1.0/24")
+
+
+def resolve_bind_host() -> str:
+    explicit = os.environ.get("HOST")
+    if explicit:
+        return explicit
+    network = ipaddress.ip_network(BIND_SUBNET, strict=False)
+    # ask the kernel which local IP would be used to reach an address in the subnet
+    probe = str(next(network.hosts()))
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect((probe, 1))
+        candidate = s.getsockname()[0]
+    finally:
+        s.close()
+    if ipaddress.ip_address(candidate) in network:
+        return candidate
+    logger.warning("No local interface in %s; falling back to 0.0.0.0", BIND_SUBNET)
+    return "0.0.0.0"
+
+
+# ---------- models ----------
+
+class CameraConfig(BaseModel):
+    id: str = Field(min_length=1, pattern=r"^[A-Za-z0-9_\-]+$")
+    label: str
+    type: Literal["usb", "gige"]
+    prefix: str
+    fps: int = Field(default=12, ge=1, le=60)
+    width: int = Field(default=640, ge=16)
+    height: int = Field(default=480, ge=16)
+
+    @field_validator("prefix")
+    @classmethod
+    def _prefix_ends_with_colon(cls, v: str) -> str:
+        if not v.endswith(":"):
+            raise ValueError("prefix must end with ':'")
+        return v
+
+    def pv(self, suffix: str) -> str:
+        return f"{self.prefix}{suffix}"
+
+
+class ControlUpdate(BaseModel):
+    exposure: Optional[float] = None
+    gain: Optional[float] = None
+
+
+# ---------- camera stream ----------
 
 class CameraStream:
-    """Manages camera frame capture and encoding"""
-
-    def __init__(self):
-        self.frame_queue = queue.Queue(maxsize=2)
+    def __init__(self, cfg: CameraConfig):
+        self.cfg = cfg
+        self.frame_queue: queue.Queue = queue.Queue(maxsize=2)
         self.running = False
-        self.current_frame = None
+        self.current_frame: Optional[np.ndarray] = None
         self.lock = threading.Lock()
+        self.capture_thread: Optional[threading.Thread] = None
 
-    def start(self):
-        """Start the camera capture thread"""
-        if not self.running:
-            self.running = True
-            self.capture_thread = threading.Thread(target=self._capture_frames, daemon=True)
-            self.capture_thread.start()
-            logger.info("Camera stream started")
+    def start(self) -> None:
+        if self.running:
+            return
+        self.running = True
+        self.capture_thread = threading.Thread(
+            target=self._capture_loop, daemon=True, name=f"camera-{self.cfg.id}"
+        )
+        self.capture_thread.start()
+        logger.info("Camera %s started (prefix=%s)", self.cfg.id, self.cfg.prefix)
 
-    def stop(self):
-        """Stop the camera capture thread"""
+    def stop(self) -> None:
         self.running = False
-        logger.info("Camera stream stopped")
+        logger.info("Camera %s stopped", self.cfg.id)
 
-    def _capture_frames(self):
-        """Capture frames from EPICS PV in a background thread"""
+    def _capture_loop(self) -> None:
+        period = 1.0 / self.cfg.fps
         while self.running:
             try:
-                if not EPICS_AVAILABLE:
-                    # Demo mode: generate test pattern
-                    frame = self._generate_test_frame()
-                else:
-                    # Read image data from EPICS PV
-                    frame = self._read_epics_frame()
-                    # Fall back to test pattern if EPICS frame unavailable
-                    if frame is None:
-                        frame = self._generate_test_frame()
+                frame = self._read_epics_frame() if EPICS_AVAILABLE else None
+                if frame is None:
+                    frame = self._demo_frame()
 
-                if frame is not None:
-                    # Resize to output dimensions
-                    frame = cv2.resize(frame, (OUTPUT_WIDTH, OUTPUT_HEIGHT))
+                frame = cv2.resize(frame, (self.cfg.width, self.cfg.height))
+                with self.lock:
+                    self.current_frame = frame.copy()
+                try:
+                    self.frame_queue.put_nowait(frame)
+                except queue.Full:
+                    pass
 
-                    with self.lock:
-                        self.current_frame = frame.copy()
-
-                    # Try to add to queue, drop if full
-                    try:
-                        self.frame_queue.put_nowait(frame)
-                    except queue.Full:
-                        pass
-
-                # Control frame rate
-                time.sleep(1 / STREAM_FPS)
-
+                time.sleep(period)
             except Exception as e:
-                logger.error(f"Error capturing frame: {e}")
+                logger.error("Camera %s capture error: %s", self.cfg.id, e)
                 time.sleep(1)
 
-    def _read_epics_frame(self) -> np.ndarray:
-        """Read image data from EPICS PV"""
+    def _read_epics_frame(self) -> Optional[np.ndarray]:
         try:
-            # Get image array from EPICS
-            image_data = caget(EPICS_IMAGE_PV)
-
-            if image_data is None:
+            data = caget(self.cfg.pv("image1:ArrayData"))
+            if data is None or data.size == 0:
                 return None
-
-            # Get dimensions if available
-            height = caget(EPICS_HEIGHT_PV)
-            width = caget(EPICS_WIDTH_PV)
-
-            # Reshape if dimensions are known
-            if height and width:
-                if len(image_data.shape) == 1:
-                    frame = image_data.reshape((int(height), int(width)))
-                else:
-                    frame = image_data
+            h = caget(self.cfg.pv("cam1:ArraySizeY_RBV"))
+            w = caget(self.cfg.pv("cam1:ArraySizeX_RBV"))
+            if not (h and w and int(h) > 0 and int(w) > 0):
+                return None  # IOC up but camera not acquiring yet
+            if len(data.shape) == 1:
+                if data.size < int(h) * int(w):
+                    return None
+                frame = data[: int(h) * int(w)].reshape((int(h), int(w)))
             else:
-                frame = image_data
-
-            # Convert to uint8 if needed
+                frame = data
             if frame.dtype != np.uint8:
                 frame = np.uint8(frame)
-
-            # Convert to BGR for OpenCV if grayscale
             if len(frame.shape) == 2:
                 frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-
             return frame
-
         except Exception as e:
-            logger.error(f"Error reading EPICS frame: {e}")
+            logger.debug("Camera %s caget failed: %s", self.cfg.id, e)
             return None
 
-    def _generate_test_frame(self) -> np.ndarray:
-        """Generate a test pattern frame (demo mode)"""
-        frame = np.zeros((OUTPUT_HEIGHT, OUTPUT_WIDTH, 3), dtype=np.uint8)
-
-        # Add test pattern: moving gradient
-        t = int(time.time() * 100) % OUTPUT_WIDTH
-        frame[:, :] = (np.arange(OUTPUT_HEIGHT)[:, np.newaxis] + t) % 256
-
-        # Add text
-        cv2.putText(frame, "Demo Mode - EPICS Camera Server", (10, 30),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.putText(frame, f"Time: {time.time():.1f}", (10, 70),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-
+    def _demo_frame(self) -> np.ndarray:
+        t = int(time.time() * 100) % 256
+        gradient = ((np.arange(self.cfg.height)[:, np.newaxis]
+                     + np.arange(self.cfg.width)[np.newaxis, :]
+                     + t) % 256).astype(np.uint8)
+        frame = np.stack([gradient, gradient, gradient], axis=2)
+        cv2.putText(frame, f"{self.cfg.id} (demo)", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(frame, f"prefix={self.cfg.prefix}", (10, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
         return frame
 
-    def get_frame(self) -> np.ndarray:
-        """Get the current frame"""
+    def get_frame(self) -> Optional[np.ndarray]:
         with self.lock:
             return self.current_frame.copy() if self.current_frame is not None else None
 
-    def get_frame_generator(self):
-        """Generate frames for streaming"""
-        while self.running:
-            try:
-                frame = self.frame_queue.get(timeout=1)
-                yield frame
-            except queue.Empty:
-                continue
+    def is_connected(self) -> bool:
+        return self.current_frame is not None
+
+    # control
+
+    def read_control(self) -> dict:
+        if not EPICS_AVAILABLE:
+            return {"exposure": None, "gain": None}
+        return {
+            "exposure": _safe_caget(self.cfg.pv("cam1:AcquireTime_RBV")),
+            "gain": _safe_caget(self.cfg.pv("cam1:Gain_RBV")),
+        }
+
+    def set_control(self, update: ControlUpdate) -> dict:
+        if not EPICS_AVAILABLE:
+            raise HTTPException(status_code=503, detail="pyepics not available")
+        applied = {}
+        if update.exposure is not None:
+            ok = caput(self.cfg.pv("cam1:AcquireTime"), float(update.exposure))
+            if ok != 1:
+                raise HTTPException(status_code=502, detail="caput AcquireTime failed")
+            applied["exposure"] = update.exposure
+        if update.gain is not None:
+            ok = caput(self.cfg.pv("cam1:Gain"), float(update.gain))
+            if ok != 1:
+                raise HTTPException(status_code=502, detail="caput Gain failed")
+            applied["gain"] = update.gain
+        return applied
 
 
-class H264StreamEncoder:
-    """Encodes frames to H.264/H.265 stream using ffmpeg"""
+def _safe_caget(pv: str):
+    try:
+        v = caget(pv, timeout=1.0)
+        return float(v) if v is not None else None
+    except Exception:
+        return None
 
-    def __init__(self, width: int, height: int, fps: int, bitrate: str, codec: str = "h264"):
-        self.width = width
-        self.height = height
-        self.fps = fps
-        self.bitrate = bitrate
-        self.codec = codec
-        self.process = None
 
-    def start(self, frame_generator):
-        """Start encoding process"""
-        # Determine codec-specific options
-        if self.codec == "h265":
-            encoder = "libx265"
-            preset = "ultrafast"
-        else:  # h264
-            encoder = "libx264"
-            preset = "ultrafast"
+# ---------- manager ----------
 
-        cmd = [
-            "ffmpeg",
-            "-f", "rawvideo",
-            "-pixel_format", "bgr24",
-            "-video_size", f"{self.width}x{self.height}",
-            "-framerate", str(self.fps),
-            "-i", "-",
-            "-c:v", encoder,
-            "-preset", preset,
-            "-b:v", self.bitrate,
-            "-f", "h264" if self.codec == "h264" else "hevc",
-            "-"
+class CameraManager:
+    def __init__(self, config_path: Path):
+        self.config_path = config_path
+        self.streams: dict[str, CameraStream] = {}
+        self.default: Optional[str] = None
+        self._lock = threading.Lock()
+
+    def load(self) -> None:
+        if not self.config_path.exists():
+            logger.warning("No %s found; starting with no cameras", self.config_path)
+            return
+        data = json.loads(self.config_path.read_text())
+        self.default = data.get("default")
+        for entry in data.get("cameras", []):
+            cfg = CameraConfig(**entry)
+            stream = CameraStream(cfg)
+            stream.start()
+            self.streams[cfg.id] = stream
+        if self.default and self.default not in self.streams:
+            logger.warning("default camera %s not in cameras list", self.default)
+            self.default = None
+        logger.info("Loaded %d cameras (default=%s)", len(self.streams), self.default)
+
+    def save(self) -> None:
+        with self._lock:
+            payload = {
+                "default": self.default,
+                "cameras": [s.cfg.model_dump() for s in self.streams.values()],
+            }
+            tmp = self.config_path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(payload, indent=2) + "\n")
+            os.replace(tmp, self.config_path)
+
+    def add(self, cfg: CameraConfig) -> CameraStream:
+        if cfg.id in self.streams:
+            raise HTTPException(status_code=409, detail=f"camera id '{cfg.id}' already exists")
+        stream = CameraStream(cfg)
+        stream.start()
+        self.streams[cfg.id] = stream
+        if self.default is None:
+            self.default = cfg.id
+        self.save()
+        return stream
+
+    def remove(self, camera_id: str) -> None:
+        stream = self.streams.pop(camera_id, None)
+        if stream is None:
+            raise HTTPException(status_code=404, detail=f"camera '{camera_id}' not found")
+        stream.stop()
+        if self.default == camera_id:
+            self.default = next(iter(self.streams), None)
+        self.save()
+
+    def get(self, camera_id: str) -> CameraStream:
+        stream = self.streams.get(camera_id)
+        if stream is None:
+            raise HTTPException(status_code=404, detail=f"camera '{camera_id}' not found")
+        return stream
+
+    def get_default(self) -> CameraStream:
+        if self.default is None:
+            raise HTTPException(status_code=503, detail="no default camera configured")
+        return self.get(self.default)
+
+    def list_status(self) -> list[dict]:
+        return [
+            {
+                **s.cfg.model_dump(),
+                "status": "connected" if s.is_connected() else "initializing",
+                "is_default": cid == self.default,
+            }
+            for cid, s in self.streams.items()
         ]
 
-        try:
-            self.process = subprocess.Popen(
-                cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                bufsize=10 * 1024
-            )
-        except FileNotFoundError:
-            logger.error("ffmpeg not found. Install with: sudo apt-get install ffmpeg")
-            raise
-
-    def encode_frame(self, frame: np.ndarray) -> bytes:
-        """Encode a frame and return encoded bytes"""
-        if self.process is None:
-            raise RuntimeError("Encoder not started")
-
-        try:
-            self.process.stdin.write(frame.tobytes())
-            self.process.stdin.flush()
-        except Exception as e:
-            logger.error(f"Error writing to encoder: {e}")
-            raise
-
-    def read_encoded(self, size: int = 65536) -> bytes:
-        """Read encoded data from ffmpeg"""
-        if self.process is None:
-            raise RuntimeError("Encoder not started")
-
-        try:
-            return self.process.stdout.read(size)
-        except Exception as e:
-            logger.error(f"Error reading from encoder: {e}")
-            raise
-
-    def stop(self):
-        """Stop the encoding process"""
-        if self.process:
-            try:
-                self.process.stdin.close()
-                self.process.terminate()
-                self.process.wait(timeout=5)
-            except:
-                self.process.kill()
-            self.process = None
+    def shutdown(self) -> None:
+        for s in self.streams.values():
+            s.stop()
 
 
-camera_stream = CameraStream()
+# ---------- app ----------
+
+manager = CameraManager(CONFIG_PATH)
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Manage camera stream lifecycle"""
-    # Startup
-    camera_stream.start()
-    logger.info("Application startup complete")
+async def lifespan(_: FastAPI):
+    manager.load()
     yield
-    # Shutdown
-    camera_stream.stop()
-    logger.info("Application shutdown complete")
+    manager.shutdown()
 
 
-app = FastAPI(title="EPICS Camera Server", lifespan=lifespan)
-
-# Add CORS middleware to allow requests from React UI
+app = FastAPI(title="EPICS Multi-Camera Server", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -274,142 +317,150 @@ app.add_middleware(
 )
 
 
-@app.get("/health")
-async def health_check():
-    """Health check endpoint"""
+def _mjpeg_response(stream: CameraStream) -> StreamingResponse:
+    async def gen():
+        while stream.running:
+            frame = stream.get_frame()
+            if frame is None:
+                await asyncio.sleep(0.05)
+                continue
+            ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            if ok:
+                yield (b"--frame\r\n"
+                       b"Content-Type: image/jpeg\r\n"
+                       b"Content-Length: " + str(len(buf)).encode() + b"\r\n\r\n"
+                       + buf.tobytes() + b"\r\n")
+            await asyncio.sleep(1.0 / stream.cfg.fps)
+
+    return StreamingResponse(gen(), media_type="multipart/x-mixed-replace; boundary=frame")
+
+
+def _snapshot_response(stream: CameraStream, ext: str) -> Response:
+    frame = stream.get_frame()
+    if frame is None:
+        raise HTTPException(status_code=503, detail="camera not ready")
+    ok, buf = cv2.imencode(f".{ext}", frame,
+                           [cv2.IMWRITE_JPEG_QUALITY, 95] if ext == "jpg" else [])
+    if not ok:
+        raise HTTPException(status_code=500, detail="encode failed")
+    media = "image/jpeg" if ext == "jpg" else "image/png"
+    return Response(content=buf.tobytes(), media_type=media)
+
+
+def _info_payload(stream: CameraStream) -> dict:
+    cfg = stream.cfg
     return {
-        "status": "healthy",
-        "camera": "connected" if camera_stream.current_frame is not None else "initializing",
-        "epics_available": EPICS_AVAILABLE
+        "id": cfg.id,
+        "label": cfg.label,
+        "type": cfg.type,
+        "prefix": cfg.prefix,
+        "resolution": {"width": cfg.width, "height": cfg.height},
+        "fps": cfg.fps,
+        "epics_pv": {
+            "image": cfg.pv("image1:ArrayData"),
+            "height": cfg.pv("cam1:ArraySizeY_RBV"),
+            "width": cfg.pv("cam1:ArraySizeX_RBV"),
+            "exposure": cfg.pv("cam1:AcquireTime"),
+            "gain": cfg.pv("cam1:Gain"),
+        },
     }
 
 
+# ---------- multi-camera endpoints ----------
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "healthy",
+        "epics_available": EPICS_AVAILABLE,
+        "default": manager.default,
+        "cameras": [
+            {"id": cid, "status": "connected" if s.is_connected() else "initializing"}
+            for cid, s in manager.streams.items()
+        ],
+    }
+
+
+@app.get("/cameras")
+async def list_cameras():
+    return {"default": manager.default, "cameras": manager.list_status()}
+
+
+@app.post("/cameras", status_code=201)
+async def add_camera(cfg: CameraConfig):
+    manager.add(cfg)
+    return _info_payload(manager.get(cfg.id))
+
+
+@app.delete("/cameras/{camera_id}")
+async def delete_camera(camera_id: str):
+    manager.remove(camera_id)
+    return {"removed": camera_id, "default": manager.default}
+
+
+@app.get("/cameras/{camera_id}")
+async def camera_info(camera_id: str):
+    return _info_payload(manager.get(camera_id))
+
+
+@app.get("/cameras/{camera_id}/stream")
+async def camera_stream(camera_id: str):
+    return _mjpeg_response(manager.get(camera_id))
+
+
+@app.get("/cameras/{camera_id}/snapshot")
+async def camera_snapshot(camera_id: str):
+    return _snapshot_response(manager.get(camera_id), "jpg")
+
+
+@app.get("/cameras/{camera_id}/snapshot.png")
+async def camera_snapshot_png(camera_id: str):
+    return _snapshot_response(manager.get(camera_id), "png")
+
+
+@app.get("/cameras/{camera_id}/control")
+async def get_control(camera_id: str):
+    stream = manager.get(camera_id)
+    return await asyncio.to_thread(stream.read_control)
+
+
+@app.put("/cameras/{camera_id}/control")
+async def put_control(camera_id: str, update: ControlUpdate):
+    stream = manager.get(camera_id)
+    applied = await asyncio.to_thread(stream.set_control, update)
+    rbv = await asyncio.to_thread(stream.read_control)
+    return {"applied": applied, "current": rbv}
+
+
+# ---------- legacy aliases (default camera) ----------
+
 @app.get("/stream")
-async def stream_video():
-    """Stream live H.264/H.265 video"""
-
-    async def video_generator():
-        encoder = H264StreamEncoder(
-            OUTPUT_WIDTH, OUTPUT_HEIGHT, STREAM_FPS, STREAM_BITRATE, CODEC
-        )
-
-        try:
-            encoder.start(camera_stream.get_frame_generator())
-
-            while camera_stream.running:
-                frame = camera_stream.get_frame_generator()
-                try:
-                    frame_data = next(frame)
-                    encoder.encode_frame(frame_data)
-
-                    # Read encoded chunks
-                    chunk = encoder.read_encoded(65536)
-                    if chunk:
-                        yield chunk
-                except StopIteration:
-                    break
-                except Exception as e:
-                    logger.error(f"Error in stream: {e}")
-                    break
-        finally:
-            encoder.stop()
-
-    # Alternative simpler streaming method using MJPEG
-    async def mjpeg_generator():
-        while camera_stream.running:
-            frame = camera_stream.get_frame()
-            if frame is None:
-                await asyncio.sleep(0.01)
-                continue
-
-            ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-            if ret:
-                yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n'
-                       b'Content-Length: ' + str(len(buffer)).encode() + b'\r\n\r\n'
-                       + buffer.tobytes() + b'\r\n')
-
-            await asyncio.sleep(1 / STREAM_FPS)
-
-    return StreamingResponse(
-        mjpeg_generator(),
-        media_type="multipart/x-mixed-replace; boundary=frame"
-    )
+async def legacy_stream():
+    return _mjpeg_response(manager.get_default())
 
 
 @app.get("/snapshot")
-async def get_snapshot():
-    """Get a single snapshot image"""
-    frame = camera_stream.get_frame()
-
-    if frame is None:
-        raise HTTPException(status_code=503, detail="Camera not ready")
-
-    ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
-
-    if not ret:
-        raise HTTPException(status_code=500, detail="Failed to encode snapshot")
-
-    return Response(content=buffer.tobytes(), media_type="image/jpeg")
+async def legacy_snapshot():
+    return _snapshot_response(manager.get_default(), "jpg")
 
 
 @app.get("/snapshot.png")
-async def get_snapshot_png():
-    """Get a single snapshot image as PNG"""
-    frame = camera_stream.get_frame()
-
-    if frame is None:
-        raise HTTPException(status_code=503, detail="Camera not ready")
-
-    ret, buffer = cv2.imencode('.png', frame)
-
-    if not ret:
-        raise HTTPException(status_code=500, detail="Failed to encode snapshot")
-
-    return Response(content=buffer.tobytes(), media_type="image/png")
+async def legacy_snapshot_png():
+    return _snapshot_response(manager.get_default(), "png")
 
 
 @app.get("/info")
-async def get_info():
-    """Get camera information"""
-    return {
-        "resolution": {
-            "width": OUTPUT_WIDTH,
-            "height": OUTPUT_HEIGHT
-        },
-        "fps": STREAM_FPS,
-        "codec": CODEC,
-        "bitrate": STREAM_BITRATE,
-        "epics_pv": {
-            "image": EPICS_IMAGE_PV,
-            "height": EPICS_HEIGHT_PV,
-            "width": EPICS_WIDTH_PV
-        }
-    }
+async def legacy_info():
+    return _info_payload(manager.get_default())
 
 
 if __name__ == "__main__":
     import uvicorn
 
-    print("""
-    ╔═══════════════════════════════════════════════════════════╗
-    ║         EPICS Camera Streaming Server                      ║
-    ╚═══════════════════════════════════════════════════════════╝
-    """)
-    print("Starting server on 0.0.0.0:8004")
-    print("Health check: http://localhost:8004/health")
-    print("Stream: http://localhost:8004/stream")
-    print("Snapshot: http://localhost:8004/snapshot")
-    print("Info: http://localhost:8004/info")
-    print()
-
-    # Verify dependencies
+    host = resolve_bind_host()
+    print("EPICS Multi-Camera Server")
+    print(f"Config: {CONFIG_PATH}")
+    print(f"Listening on {host}:8004")
     if not EPICS_AVAILABLE:
-        print("⚠️  pyepics not installed - running in demo mode")
-        print("   Install with: pip install pyepics")
-        print()
-
-    print("Press Ctrl+C to stop the server")
-    print()
-
-    uvicorn.run(app, host="0.0.0.0", port=8004, log_level="info")
+        print("WARNING: pyepics not installed - all cameras will run in demo mode")
+    uvicorn.run(app, host=host, port=8004, log_level="info")

@@ -1,228 +1,296 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 
 /**
  * CameraStreamer Component
  *
- * Displays live video stream from the EPICS camera server
- * and provides snapshot functionality
+ * Multi-camera stream viewer with exposure / gain controls.
  *
  * Usage:
- * <CameraStreamer serverUrl="http://localhost:8001" />
+ *   <CameraStreamer serverUrl="http://localhost:8004" />
  */
-const CameraStreamer = ({ serverUrl = 'http://localhost:8001' }) => {
-  const [isConnected, setIsConnected] = useState(false);
+const CameraStreamer = ({ serverUrl = 'http://localhost:8004' }) => {
   const [health, setHealth] = useState(null);
+  const [cameras, setCameras] = useState([]);
+  const [selectedId, setSelectedId] = useState(null);
   const [info, setInfo] = useState(null);
+  const [control, setControl] = useState({ exposure: null, gain: null });
+  const [exposureInput, setExposureInput] = useState('');
+  const [gainInput, setGainInput] = useState('');
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState(null);
-  const [isTakingSnapshot, setIsTakingSnapshot] = useState(false);
+  const [isApplying, setIsApplying] = useState(false);
   const [lastSnapshotTime, setLastSnapshotTime] = useState(null);
   const imageRef = useRef(null);
 
-  // Check server health on mount
-  useEffect(() => {
-    const checkHealth = async () => {
-      try {
-        const response = await fetch(`${serverUrl}/health`);
-        if (response.ok) {
-          const data = await response.json();
-          setHealth(data);
-          setIsConnected(true);
-          setError(null);
-        } else {
-          setError('Server returned error: ' + response.status);
-          setIsConnected(false);
-        }
-      } catch (err) {
-        setError('Failed to connect to camera server: ' + err.message);
-        setIsConnected(false);
-      } finally {
-        setIsLoading(false);
-      }
-    };
+  const isConnected = health?.status === 'healthy';
 
-    checkHealth();
-    const interval = setInterval(checkHealth, 5000); // Check every 5 seconds
-
-    return () => clearInterval(interval);
-  }, [serverUrl]);
-
-  // Get camera info on mount
-  useEffect(() => {
-    const fetchInfo = async () => {
-      try {
-        const response = await fetch(`${serverUrl}/info`);
-        if (response.ok) {
-          const data = await response.json();
-          setInfo(data);
-        }
-      } catch (err) {
-        console.error('Failed to fetch camera info:', err);
-      }
-    };
-
-    fetchInfo();
-  }, [serverUrl]);
-
-  // Handle snapshot
-  const handleSnapshot = async () => {
-    setIsTakingSnapshot(true);
+  const fetchHealth = useCallback(async () => {
     try {
-      const response = await fetch(`${serverUrl}/snapshot`);
-      if (response.ok) {
-        const blob = await response.blob();
-        const url = URL.createObjectURL(blob);
-
-        // Download the snapshot
-        const link = document.createElement('a');
-        link.href = url;
-        link.download = `snapshot-${Date.now()}.jpg`;
-        document.body.appendChild(link);
-        link.click();
-        document.body.removeChild(link);
-        URL.revokeObjectURL(url);
-
-        setLastSnapshotTime(new Date().toLocaleTimeString());
-        setError(null);
-      } else {
-        setError('Failed to capture snapshot');
-      }
+      const res = await fetch(`${serverUrl}/health`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setHealth(await res.json());
+      setError(null);
     } catch (err) {
-      setError('Snapshot error: ' + err.message);
+      setError(`Failed to reach camera server: ${err.message}`);
+      setHealth(null);
+    }
+  }, [serverUrl]);
+
+  const fetchCameras = useCallback(async () => {
+    try {
+      const res = await fetch(`${serverUrl}/cameras`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      setCameras(data.cameras);
+      setSelectedId((current) => {
+        if (current && data.cameras.some((c) => c.id === current)) return current;
+        return data.default || data.cameras[0]?.id || null;
+      });
+    } catch (err) {
+      console.error('Failed to fetch cameras:', err);
+    }
+  }, [serverUrl]);
+
+  const fetchInfo = useCallback(async (id) => {
+    try {
+      const res = await fetch(`${serverUrl}/cameras/${id}`);
+      if (res.ok) setInfo(await res.json());
+    } catch (err) {
+      console.error('Failed to fetch info:', err);
+    }
+  }, [serverUrl]);
+
+  const fetchControl = useCallback(async (id) => {
+    try {
+      const res = await fetch(`${serverUrl}/cameras/${id}/control`);
+      if (!res.ok) return;
+      const data = await res.json();
+      setControl(data);
+      setExposureInput(data.exposure != null ? String(data.exposure) : '');
+      setGainInput(data.gain != null ? String(data.gain) : '');
+    } catch (err) {
+      console.error('Failed to fetch control:', err);
+    }
+  }, [serverUrl]);
+
+  // initial + periodic health/cameras
+  useEffect(() => {
+    const init = async () => {
+      await Promise.all([fetchHealth(), fetchCameras()]);
+      setIsLoading(false);
+    };
+    init();
+    const t = setInterval(() => {
+      fetchHealth();
+      fetchCameras();
+    }, 5000);
+    return () => clearInterval(t);
+  }, [fetchHealth, fetchCameras]);
+
+  // refresh info + control on selection change, plus periodic control poll
+  useEffect(() => {
+    if (!selectedId) {
+      setInfo(null);
+      setControl({ exposure: null, gain: null });
+      return;
+    }
+    fetchInfo(selectedId);
+    fetchControl(selectedId);
+    const t = setInterval(() => fetchControl(selectedId), 5000);
+    return () => clearInterval(t);
+  }, [selectedId, fetchInfo, fetchControl]);
+
+  const handleSnapshot = async () => {
+    if (!selectedId) return;
+    try {
+      const res = await fetch(`${serverUrl}/cameras/${selectedId}/snapshot`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `${selectedId}-${Date.now()}.jpg`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+      setLastSnapshotTime(new Date().toLocaleTimeString());
+    } catch (err) {
+      setError(`Snapshot error: ${err.message}`);
+    }
+  };
+
+  const handleApplyControl = async () => {
+    if (!selectedId) return;
+    setIsApplying(true);
+    try {
+      const body = {};
+      if (exposureInput !== '' && Number(exposureInput) !== control.exposure) {
+        body.exposure = Number(exposureInput);
+      }
+      if (gainInput !== '' && Number(gainInput) !== control.gain) {
+        body.gain = Number(gainInput);
+      }
+      if (Object.keys(body).length === 0) return;
+      const res = await fetch(`${serverUrl}/cameras/${selectedId}/control`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        const detail = await res.text();
+        throw new Error(`HTTP ${res.status}: ${detail}`);
+      }
+      const data = await res.json();
+      setControl(data.current);
+      setError(null);
+    } catch (err) {
+      setError(`Control error: ${err.message}`);
     } finally {
-      setIsTakingSnapshot(false);
+      setIsApplying(false);
     }
   };
 
   if (isLoading) {
-    return (
-      <div style={styles.container}>
-        <div style={styles.loading}>Loading camera...</div>
-      </div>
-    );
+    return <div style={styles.container}><div style={styles.loading}>Loading cameras…</div></div>;
   }
+
+  const selectedStatus = cameras.find((c) => c.id === selectedId)?.status;
 
   return (
     <div style={styles.container}>
       <div style={styles.header}>
         <h1 style={styles.title}>EPICS Camera Stream</h1>
         <div style={styles.statusIndicator}>
-          <span
-            style={{
-              ...styles.statusDot,
-              backgroundColor: isConnected ? '#10b981' : '#ef4444'
-            }}
-          />
-          <span style={styles.statusText}>
-            {isConnected ? 'Connected' : 'Disconnected'}
-          </span>
+          <span style={{ ...styles.statusDot, backgroundColor: isConnected ? '#10b981' : '#ef4444' }} />
+          <span style={styles.statusText}>{isConnected ? 'Server connected' : 'Disconnected'}</span>
         </div>
       </div>
 
-      {error && (
-        <div style={styles.errorBanner}>
-          <span>⚠️ {error}</span>
-        </div>
-      )}
+      {error && <div style={styles.errorBanner}>⚠️ {error}</div>}
 
-      {isConnected && (
+      <div style={styles.cameraSelector}>
+        <label htmlFor="camera-select" style={styles.cameraSelectorLabel}>Camera:</label>
+        <select
+          id="camera-select"
+          value={selectedId || ''}
+          onChange={(e) => setSelectedId(e.target.value)}
+          style={styles.select}
+          disabled={cameras.length === 0}
+        >
+          {cameras.length === 0 && <option value="">No cameras configured</option>}
+          {cameras.map((c) => (
+            <option key={c.id} value={c.id}>
+              {c.label} ({c.id}){c.is_default ? ' — default' : ''} — {c.status}
+            </option>
+          ))}
+        </select>
+      </div>
+
+      {selectedId && (
         <div style={styles.mainContent}>
           <div style={styles.streamContainer}>
             <img
               ref={imageRef}
-              src={`${serverUrl}/stream`}
-              alt="Camera Stream"
+              key={`${selectedId}-stream`}
+              src={`${serverUrl}/cameras/${selectedId}/stream`}
+              alt={`${selectedId} stream`}
               style={styles.stream}
               onError={() => setError('Failed to load stream')}
               onLoad={() => setError(null)}
             />
             <div style={styles.streamOverlay}>
-              <span>Live Stream</span>
+              <span>Live: {selectedId} ({selectedStatus})</span>
             </div>
           </div>
 
-          <div style={styles.controlsPanel}>
-            <button
-              onClick={handleSnapshot}
-              disabled={isTakingSnapshot}
-              style={{
-                ...styles.button,
-                ...styles.snapshotButton,
-                opacity: isTakingSnapshot ? 0.6 : 1,
-                cursor: isTakingSnapshot ? 'not-allowed' : 'pointer'
-              }}
-            >
-              {isTakingSnapshot ? '📷 Capturing...' : '📷 Take Snapshot'}
-            </button>
+          <div style={styles.sidebar}>
+            <div style={styles.panel}>
+              <h3 style={styles.panelTitle}>Controls</h3>
+              <label style={styles.controlLabel}>
+                Exposure (s)
+                <input
+                  type="number"
+                  step="0.001"
+                  min="0"
+                  value={exposureInput}
+                  onChange={(e) => setExposureInput(e.target.value)}
+                  style={styles.numberInput}
+                />
+              </label>
+              <div style={styles.rbv}>
+                RBV: {control.exposure != null ? control.exposure.toFixed(4) : '—'}
+              </div>
+              <label style={styles.controlLabel}>
+                Gain
+                <input
+                  type="number"
+                  step="0.1"
+                  value={gainInput}
+                  onChange={(e) => setGainInput(e.target.value)}
+                  style={styles.numberInput}
+                />
+              </label>
+              <div style={styles.rbv}>
+                RBV: {control.gain != null ? control.gain.toFixed(2) : '—'}
+              </div>
+              <button
+                onClick={handleApplyControl}
+                disabled={isApplying}
+                style={{
+                  ...styles.button,
+                  ...styles.applyButton,
+                  opacity: isApplying ? 0.6 : 1,
+                  cursor: isApplying ? 'not-allowed' : 'pointer',
+                }}
+              >
+                {isApplying ? 'Applying…' : 'Apply'}
+              </button>
+              <button
+                onClick={handleSnapshot}
+                style={{ ...styles.button, ...styles.snapshotButton }}
+              >
+                📷 Snapshot
+              </button>
+              {lastSnapshotTime && (
+                <div style={styles.statusMessage}>✓ Last snapshot: {lastSnapshotTime}</div>
+              )}
+            </div>
 
-            {lastSnapshotTime && (
-              <div style={styles.statusMessage}>
-                ✓ Last snapshot: {lastSnapshotTime}
+            {info && (
+              <div style={styles.panel}>
+                <h3 style={styles.panelTitle}>Camera Settings</h3>
+                <div style={styles.infoRow}><span>Type:</span><span>{info.type}</span></div>
+                <div style={styles.infoRow}><span>Prefix:</span><span>{info.prefix}</span></div>
+                <div style={styles.infoRow}><span>Resolution:</span><span>{info.resolution.width}×{info.resolution.height}</span></div>
+                <div style={styles.infoRow}><span>FPS:</span><span>{info.fps}</span></div>
+              </div>
+            )}
+
+            {health && (
+              <div style={styles.panel}>
+                <h3 style={styles.panelTitle}>Server</h3>
+                <div style={styles.infoRow}>
+                  <span>Status:</span>
+                  <span style={styles.healthGood}>{health.status}</span>
+                </div>
+                <div style={styles.infoRow}>
+                  <span>EPICS:</span>
+                  <span style={health.epics_available ? styles.healthGood : styles.healthWarning}>
+                    {health.epics_available ? 'Available' : 'Demo mode'}
+                  </span>
+                </div>
+                <div style={styles.infoRow}>
+                  <span>Default:</span>
+                  <span>{health.default || '—'}</span>
+                </div>
+                <div style={styles.infoRow}>
+                  <span>Cameras:</span>
+                  <span>{health.cameras.length}</span>
+                </div>
               </div>
             )}
           </div>
-
-          {info && (
-            <div style={styles.infoPanel}>
-              <h3 style={styles.infoPanelTitle}>Camera Settings</h3>
-              <div style={styles.infoPanelContent}>
-                <div style={styles.infoRow}>
-                  <span>Resolution:</span>
-                  <span>
-                    {info.resolution.width}x{info.resolution.height}
-                  </span>
-                </div>
-                <div style={styles.infoRow}>
-                  <span>Frame Rate:</span>
-                  <span>{info.fps} FPS</span>
-                </div>
-                <div style={styles.infoRow}>
-                  <span>Codec:</span>
-                  <span>{info.codec.toUpperCase()}</span>
-                </div>
-                <div style={styles.infoRow}>
-                  <span>Bitrate:</span>
-                  <span>{info.bitrate}</span>
-                </div>
-              </div>
-            </div>
-          )}
-
-          {health && (
-            <div style={styles.healthPanel}>
-              <h3 style={styles.healthPanelTitle}>Server Status</h3>
-              <div style={styles.healthContent}>
-                <div style={styles.healthRow}>
-                  <span>Server:</span>
-                  <span style={styles.healthGood}>{health.status}</span>
-                </div>
-                <div style={styles.healthRow}>
-                  <span>Camera:</span>
-                  <span
-                    style={
-                      health.camera === 'connected'
-                        ? styles.healthGood
-                        : styles.healthWarning
-                    }
-                  >
-                    {health.camera}
-                  </span>
-                </div>
-                <div style={styles.healthRow}>
-                  <span>EPICS:</span>
-                  <span
-                    style={
-                      health.epics_available
-                        ? styles.healthGood
-                        : styles.healthWarning
-                    }
-                  >
-                    {health.epics_available ? 'Available' : 'Demo Mode'}
-                  </span>
-                </div>
-              </div>
-            </div>
-          )}
         </div>
       )}
     </div>
@@ -246,160 +314,79 @@ const styles = {
     paddingBottom: '16px',
     borderBottom: '2px solid #e5e7eb',
   },
-  title: {
-    margin: 0,
-    fontSize: '28px',
-    fontWeight: 'bold',
-    color: '#1f2937',
-  },
+  title: { margin: 0, fontSize: '28px', fontWeight: 'bold', color: '#1f2937' },
   statusIndicator: {
-    display: 'flex',
-    alignItems: 'center',
-    gap: '8px',
-    padding: '8px 12px',
-    backgroundColor: 'white',
-    borderRadius: '6px',
-    border: '1px solid #e5e7eb',
+    display: 'flex', alignItems: 'center', gap: '8px',
+    padding: '8px 12px', backgroundColor: 'white',
+    borderRadius: '6px', border: '1px solid #e5e7eb',
   },
-  statusDot: {
-    width: '8px',
-    height: '8px',
-    borderRadius: '50%',
-  },
-  statusText: {
-    fontSize: '14px',
-    fontWeight: '500',
-    color: '#4b5563',
-  },
-  loading: {
-    textAlign: 'center',
-    padding: '40px',
-    fontSize: '18px',
-    color: '#6b7280',
-  },
+  statusDot: { width: '8px', height: '8px', borderRadius: '50%' },
+  statusText: { fontSize: '14px', fontWeight: '500', color: '#4b5563' },
+  loading: { textAlign: 'center', padding: '40px', fontSize: '18px', color: '#6b7280' },
   errorBanner: {
-    backgroundColor: '#fee2e2',
-    border: '1px solid #fecaca',
-    color: '#991b1b',
-    padding: '12px 16px',
-    borderRadius: '6px',
-    marginBottom: '16px',
-    fontSize: '14px',
+    backgroundColor: '#fee2e2', border: '1px solid #fecaca',
+    color: '#991b1b', padding: '12px 16px', borderRadius: '6px',
+    marginBottom: '16px', fontSize: '14px',
+  },
+  cameraSelector: {
+    display: 'flex', alignItems: 'center', gap: '12px',
+    padding: '12px 16px', backgroundColor: 'white',
+    borderRadius: '6px', border: '1px solid #e5e7eb',
+    marginBottom: '20px',
+  },
+  cameraSelectorLabel: { fontSize: '14px', fontWeight: '500', color: '#1f2937' },
+  select: {
+    flex: 1, padding: '8px 10px', fontSize: '14px',
+    border: '1px solid #d1d5db', borderRadius: '4px',
+    backgroundColor: 'white',
   },
   mainContent: {
-    display: 'grid',
-    gridTemplateColumns: '1fr 320px',
-    gap: '20px',
+    display: 'grid', gridTemplateColumns: '1fr 320px', gap: '20px',
   },
   streamContainer: {
-    position: 'relative',
-    backgroundColor: 'white',
-    borderRadius: '8px',
-    overflow: 'hidden',
-    boxShadow: '0 1px 3px rgba(0,0,0,0.1)',
-    aspectRatio: '16/12',
+    position: 'relative', backgroundColor: 'white',
+    borderRadius: '8px', overflow: 'hidden',
+    boxShadow: '0 1px 3px rgba(0,0,0,0.1)', aspectRatio: '16/12',
   },
   stream: {
-    width: '100%',
-    height: '100%',
-    objectFit: 'contain',
-    backgroundColor: '#000',
+    width: '100%', height: '100%', objectFit: 'contain', backgroundColor: '#000',
   },
   streamOverlay: {
-    position: 'absolute',
-    bottom: '12px',
-    left: '12px',
-    backgroundColor: 'rgba(0,0,0,0.6)',
-    color: 'white',
-    padding: '6px 12px',
-    borderRadius: '4px',
-    fontSize: '12px',
-    fontWeight: '500',
+    position: 'absolute', bottom: '12px', left: '12px',
+    backgroundColor: 'rgba(0,0,0,0.6)', color: 'white',
+    padding: '6px 12px', borderRadius: '4px',
+    fontSize: '12px', fontWeight: '500',
   },
-  controlsPanel: {
-    display: 'flex',
-    flexDirection: 'column',
-    gap: '12px',
-    gridColumn: '2',
+  sidebar: { display: 'flex', flexDirection: 'column', gap: '16px' },
+  panel: {
+    backgroundColor: 'white', borderRadius: '8px', padding: '16px',
+    boxShadow: '0 1px 3px rgba(0,0,0,0.1)',
+    display: 'flex', flexDirection: 'column', gap: '8px',
   },
+  panelTitle: { margin: '0 0 4px 0', fontSize: '14px', fontWeight: '600', color: '#1f2937' },
+  controlLabel: {
+    display: 'flex', flexDirection: 'column', gap: '4px',
+    fontSize: '13px', color: '#4b5563',
+  },
+  numberInput: {
+    padding: '6px 8px', fontSize: '13px',
+    border: '1px solid #d1d5db', borderRadius: '4px',
+  },
+  rbv: { fontSize: '12px', color: '#6b7280', marginTop: '-4px' },
   button: {
-    padding: '12px 16px',
-    borderRadius: '6px',
-    border: 'none',
-    fontSize: '14px',
-    fontWeight: '600',
-    transition: 'all 0.2s',
-    cursor: 'pointer',
+    padding: '10px 14px', borderRadius: '6px', border: 'none',
+    fontSize: '14px', fontWeight: '600', cursor: 'pointer',
   },
-  snapshotButton: {
-    backgroundColor: '#3b82f6',
-    color: 'white',
-  },
+  applyButton: { backgroundColor: '#10b981', color: 'white' },
+  snapshotButton: { backgroundColor: '#3b82f6', color: 'white' },
   statusMessage: {
-    padding: '10px 12px',
-    backgroundColor: '#ecfdf5',
-    border: '1px solid #a7f3d0',
-    color: '#065f46',
-    borderRadius: '6px',
-    fontSize: '12px',
-    textAlign: 'center',
+    padding: '8px 10px', backgroundColor: '#ecfdf5',
+    border: '1px solid #a7f3d0', color: '#065f46',
+    borderRadius: '6px', fontSize: '12px', textAlign: 'center',
   },
-  infoPanel: {
-    gridColumn: '2',
-    backgroundColor: 'white',
-    borderRadius: '8px',
-    padding: '16px',
-    boxShadow: '0 1px 3px rgba(0,0,0,0.1)',
-  },
-  infoPanelTitle: {
-    margin: '0 0 12px 0',
-    fontSize: '14px',
-    fontWeight: '600',
-    color: '#1f2937',
-  },
-  infoPanelContent: {
-    display: 'flex',
-    flexDirection: 'column',
-    gap: '8px',
-  },
-  infoRow: {
-    display: 'flex',
-    justifyContent: 'space-between',
-    fontSize: '13px',
-    color: '#4b5563',
-  },
-  healthPanel: {
-    gridColumn: '2',
-    backgroundColor: 'white',
-    borderRadius: '8px',
-    padding: '16px',
-    boxShadow: '0 1px 3px rgba(0,0,0,0.1)',
-  },
-  healthPanelTitle: {
-    margin: '0 0 12px 0',
-    fontSize: '14px',
-    fontWeight: '600',
-    color: '#1f2937',
-  },
-  healthContent: {
-    display: 'flex',
-    flexDirection: 'column',
-    gap: '8px',
-  },
-  healthRow: {
-    display: 'flex',
-    justifyContent: 'space-between',
-    fontSize: '13px',
-    alignItems: 'center',
-  },
-  healthGood: {
-    color: '#10b981',
-    fontWeight: '500',
-  },
-  healthWarning: {
-    color: '#f59e0b',
-    fontWeight: '500',
-  },
+  infoRow: { display: 'flex', justifyContent: 'space-between', fontSize: '13px', color: '#4b5563' },
+  healthGood: { color: '#10b981', fontWeight: '500' },
+  healthWarning: { color: '#f59e0b', fontWeight: '500' },
 };
 
 export default CameraStreamer;

@@ -1,482 +1,189 @@
-# EPICS Camera Streaming Server
+# EPICS Multi-Camera Server
 
-A FastAPI-based server for live video streaming from EPICS IOC USB Basler cameras with snapshot capture capabilities. Designed to work with React UI applications.
+FastAPI server that streams MJPEG video and serves snapshots from one or more
+EPICS Basler cameras (USB or GigE). Reads image data via `pyepics`, exposes
+per-camera exposure / gain controls, and supports adding or removing cameras
+at runtime via REST.
 
-## How the Camera Server Fits in the System
+## How it fits in the system
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                           React UI (5173)                                │
-│                           Camera Tab                                     │
-└────────────────────────────────┬────────────────────────────────────────┘
-                                 │
-                    ┌────────────┴────────────┐
-                    │ HTTP GET /stream        │
-                    │ (MJPEG continuous)      │
-                    └────────────┬────────────┘
-                                 │
+┌─────────────────────────────────────────────────────────────────┐
+│                       React UI (5173)                            │
+│              CameraStreamer.jsx / CameraView.tsx                 │
+└────────────────────────────────┬────────────────────────────────┘
+                                 │ HTTP: /cameras/{id}/stream
                                  ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                    Camera Server (8004)                                  │
-│                    camera_server.py                                      │
-│                                                                         │
-│    Reads image data from EPICS PVs → Encodes as MJPEG → Streams        │
-└────────────────────────────────┬────────────────────────────────────────┘
-                                 │
-                    ┌────────────┴────────────┐
-                    │ EPICS Channel Access    │
-                    │ caget BASLER:IMAGE      │
-                    └────────────┬────────────┘
-                                 │
+┌─────────────────────────────────────────────────────────────────┐
+│                    Camera Server (8004)                          │
+│                    camera_server.py                              │
+│                                                                  │
+│   CameraManager → CameraStream(id) → MJPEG / JPEG / PNG          │
+│                ↘                  ↘ caget/caput exposure & gain  │
+└────────────────────────────────┬────────────────────────────────┘
+                                 │ EPICS Channel Access
                                  ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                    Basler USB IOC (55055)                                │
-│                    /opt/iocs/basler-usb/                                 │
-│                                                                         │
-│    Captures frames from USB camera → Publishes as EPICS PVs             │
-└─────────────────────────────────────────────────────────────────────────┘
+                ┌────────────────┴────────────────┐
+                │                                 │
+        basler-usb IOC (basler1:)        basler-gige IOC (gige1:)
+        /opt/iocs/basler-usb/            /opt/iocs/basler-gige/
 ```
 
-**Key Points:**
-- The Camera Server is a **bridge** between EPICS and HTTP
-- Unlike other services, it serves continuous MJPEG video (not JSON)
-- No WebSocket needed — the `<img src="/stream">` tag handles streaming
-- Runs independently of the Bluesky RunEngine
+## Quick start
 
-For the complete system architecture, see [CODEBASE_ARCHITECTURE.md](CODEBASE_ARCHITECTURE.md).
-
-## Overview
-
-This server provides real-time video streaming from your EPICS-controlled Basler camera with the following features:
-
-- **Live video streaming** to web browsers and React applications
-- **Snapshot capture** with automatic download
-- **H.264/H.265 encoding** support (encoder exists; current `/stream` serves MJPEG)
-- **Health monitoring** with real-time server and camera status
-- **CORS enabled** for seamless React integration
-- **Demo mode** for testing without EPICS connection
-- **Multi-threaded frame capture** for reliable performance
-
-## Quick Start
-
-### Prerequisites
-
-- Python 3.7+
-- FFmpeg (for H.264/H.265 encoding)
-- EPICS environment (optional, demo mode available)
-
-### Installation
-
-1. **Install system dependencies:**
-   ```bash
-   sudo apt-get update
-   sudo apt-get install ffmpeg python3-pip
-   ```
-
-2. **Install Python dependencies:**
-   ```bash
-   pip install -r /opt/camera/requirements.txt
-   ```
-
-3. **Configure EPICS environment (if needed):**
-   ```bash
-   export EPICS_BASE=/opt/epics
-   export EPICS_CA_ADDR_LIST=your_epics_host
-   ```
-
-4. **Update EPICS PV names in `/opt/camera/camera_server.py`:**
-   ```python
-   EPICS_IMAGE_PV = "YOUR:IMAGE:PV"      # Image data
-   EPICS_HEIGHT_PV = "YOUR:HEIGHT:PV"    # Image height
-   EPICS_WIDTH_PV = "YOUR:WIDTH:PV"      # Image width
-   ```
-
-5. **Start the server:**
-   ```bash
-   python3 /opt/camera/camera_server.py
-   ```
-
-   Or using the startup script:
-   ```bash
-   bash /opt/scripts/start_camera_server.sh
-   ```
-
-The server will start on `0.0.0.0:8004` and be accessible from any machine on your network.
-
-## Files
-
-### Core Application
-
-- **`camera_server.py`** - Main FastAPI application
-  - `CameraStream` class: Manages frame capture from EPICS PVs
-  - `H264StreamEncoder` class: Encodes frames using FFmpeg
-  - REST endpoints for streaming, snapshots, and health checks
-
-- **`CameraView.tsx`** - React component for displaying the stream
-  - Live video display
-  - Snapshot button
-  - Server health monitoring
-  - Camera settings display
-  - Responsive design with Tailwind-style styling
-
-- **`requirements_camera.txt`** - Python package dependencies
-
-- **`start_camera_server.sh`** - Startup script with dependency checks
-
-## Configuration
-
-Edit `/opt/camera/camera_server.py` to customize:
-
-```python
-# EPICS Process Variables
-EPICS_IMAGE_PV = "BASLER:IMAGE"      # PV name for image data
-EPICS_HEIGHT_PV = "BASLER:HEIGHT"    # PV name for image height
-EPICS_WIDTH_PV = "BASLER:WIDTH"      # PV name for image width
-
-# Video Streaming Settings
-STREAM_FPS = 12                       # Frames per second (10-15 recommended)
-STREAM_BITRATE = "2M"                 # Video bitrate (e.g., "1M", "2M", "4M")
-CODEC = "h264"                        # "h264" or "h265" for better compression
-
-# Output Resolution
-OUTPUT_WIDTH = 640                    # Width in pixels (medium resolution)
-OUTPUT_HEIGHT = 480                   # Height in pixels
-```
-
-### Recommended Settings for Different Scenarios
-
-**Low Bandwidth (Remote Access):**
-```python
-STREAM_FPS = 10
-STREAM_BITRATE = "1M"
-OUTPUT_WIDTH = 480
-OUTPUT_HEIGHT = 360
-```
-
-**High Quality (Local Network):**
-```python
-STREAM_FPS = 30
-STREAM_BITRATE = "4M"
-OUTPUT_WIDTH = 1280
-OUTPUT_HEIGHT = 960
-```
-
-**Balanced (Recommended):**
-```python
-STREAM_FPS = 12
-STREAM_BITRATE = "2M"
-OUTPUT_WIDTH = 640
-OUTPUT_HEIGHT = 480
-```
-
-## API Endpoints
-
-### Health Check
-```
-GET /health
-```
-Returns server and camera status.
-
-**Response:**
-```json
-{
-  "status": "healthy",
-  "camera": "connected",
-  "epics_available": true
-}
-```
-
-### Live Stream
-```
-GET /stream
-```
-Returns MJPEG video stream compatible with HTML `<img>` tags and most browsers.
-
-**Usage in HTML:**
-```html
-<img src="http://server:8004/stream" alt="Camera Stream" />
-```
-
-**Usage in React:**
-```jsx
-<img src={`http://server:8004/stream`} alt="Live Stream" />
-```
-
-### Snapshot (JPEG)
-```
-GET /snapshot
-```
-Returns a single JPEG image of the current frame.
-
-**Response:** Binary JPEG image data
-
-### Snapshot (PNG)
-```
-GET /snapshot.png
-```
-Returns a single PNG image of the current frame.
-
-**Response:** Binary PNG image data
-
-### Camera Info
-```
-GET /info
-```
-Returns camera configuration and server settings.
-
-**Response:**
-```json
-{
-  "resolution": {
-    "width": 640,
-    "height": 480
-  },
-  "fps": 12,
-  "codec": "h264",
-  "bitrate": "2M",
-  "epics_pv": {
-    "image": "BASLER:IMAGE",
-    "height": "BASLER:HEIGHT",
-    "width": "BASLER:WIDTH"
-  }
-}
-```
-
-## React Integration
-
-### Basic Usage
-
-1. **The React component is already in the project:**
-   ```
-   /opt/react-ui/src/components/CameraView.tsx
-   ```
-
-2. **Import and use in your app:**
-   ```tsx
-   import CameraView from './components/CameraView';
-
-   export default function App() {
-     return (
-       <div>
-         <h1>My EPICS Application</h1>
-         <CameraView serverUrl="http://localhost:8004" />
-       </div>
-     );
-   }
-   ```
-
-### Component Props
-
-```typescript
-interface CameraViewProps {
-  serverUrl?: string;  // Default: "http://localhost:8004"
-}
-```
-
-### Features
-
-- **Live Stream Display** - Shows continuous video feed with MJPEG streaming
-- **Snapshot Button** - Captures and automatically downloads images
-- **Health Monitoring** - Displays real-time connection status
-- **Camera Info** - Shows current resolution, FPS, codec, and bitrate
-- **Server Status** - Displays EPICS and ffmpeg availability
-- **Auto-Reconnect** - Health checks every 5 seconds with automatic recovery
-- **Error Handling** - User-friendly error messages and status indicators
-
-## Usage Examples
-
-### Command Line Testing
-
-**Check server health:**
 ```bash
-curl http://localhost:8004/health
-```
+# system deps
+sudo apt-get install ffmpeg python3-pip
 
-**Get current snapshot:**
-```bash
-curl -o snapshot.jpg http://localhost:8004/snapshot
-curl -o snapshot.png http://localhost:8004/snapshot.png
-```
+# python deps (in the venv at /opt/camera/camera-env)
+source /opt/camera/camera-env/bin/activate
+pip install -r requirements.txt
 
-**Get camera info:**
-```bash
-curl http://localhost:8004/info | python3 -m json.tool
-```
-
-### Docker Deployment
-
-Create a `Dockerfile`:
-```dockerfile
-FROM python:3.11-slim
-
-RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /app
-
-COPY requirements_camera.txt .
-RUN pip install -r requirements_camera.txt
-
-COPY camera_server.py .
-
-EXPOSE 8004
-
-CMD ["python3", "camera_server.py"]
-```
-
-Build and run:
-```bash
-docker build -t epics-camera-server .
-docker run -p 8004:8004 -e EPICS_CA_ADDR_LIST=epics_host epics-camera-server
-```
-
-## Demo Mode
-
-The server includes a built-in demo mode for testing without EPICS:
-
-1. If `pyepics` is not installed, the server will generate test patterns automatically
-2. Demo mode displays animated gradients with timestamp and status
-3. Perfect for testing your React UI and API integration
-4. Seamlessly switches to live camera when EPICS is available
-
-To run in demo mode:
-```bash
-# Without installing pyepics
+# run
 python3 /opt/camera/camera_server.py
 ```
 
-The server will show: `⚠️ pyepics not installed - running in demo mode`
+The server binds to whichever local interface is in `192.168.1.0/24` (currently
+`192.168.1.50`) on port `8004`. Override with `HOST=0.0.0.0` or
+`CAMERA_SERVER_SUBNET=10.0.0.0/24` env vars.
+
+## Files
+
+| File | Purpose |
+|---|---|
+| `camera_server.py` | FastAPI app, CameraManager, CameraStream, REST endpoints |
+| `cameras.json` | Persistent list of configured cameras + default |
+| `CameraStreamer.jsx` | Reference React component (camera dropdown, controls, snapshot) |
+| `requirements.txt` | Python deps |
+
+## Configuration
+
+Cameras live in `cameras.json` next to `camera_server.py` (override with
+`CAMERAS_CONFIG=/some/path.json`). Schema:
+
+```json
+{
+  "default": "basler1",
+  "cameras": [
+    {
+      "id": "basler1",
+      "label": "Basler USB",
+      "type": "usb",
+      "prefix": "basler1:",
+      "fps": 12,
+      "width": 640,
+      "height": 480
+    },
+    {
+      "id": "gige1",
+      "label": "Basler GigE 1 (acA1920-25gm)",
+      "type": "gige",
+      "prefix": "gige1:",
+      "fps": 12,
+      "width": 640,
+      "height": 480
+    }
+  ]
+}
+```
+
+Field rules:
+- `id` — unique, `[A-Za-z0-9_-]+`. Used in URLs.
+- `prefix` — must end with `:`. All EPICS PVs are derived from it.
+- `type` — `usb` or `gige` (informational; both use the same Pylon driver records).
+- `fps` 1–60, default 12. Capture loop polls EPICS at this rate.
+- `width` / `height` — output resolution; frames are resized before encoding.
+
+PVs derived from prefix:
+
+| Purpose | PV |
+|---|---|
+| Image data | `{prefix}image1:ArrayData` |
+| Width / height RBV | `{prefix}cam1:ArraySizeX_RBV` / `cam1:ArraySizeY_RBV` |
+| Exposure (set / RBV) | `{prefix}cam1:AcquireTime` / `cam1:AcquireTime_RBV` |
+| Gain (set / RBV) | `{prefix}cam1:Gain` / `cam1:Gain_RBV` |
+
+`POST /cameras` and `DELETE /cameras/{id}` rewrite `cameras.json` atomically.
+Editing the file by hand requires a server restart to take effect.
+
+## API endpoints
+
+### Multi-camera
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/health` | Server status, EPICS availability, default id, per-camera summary |
+| `GET` | `/cameras` | List configured cameras with status |
+| `POST` | `/cameras` | Add a camera (body = config object). 409 on duplicate id |
+| `DELETE` | `/cameras/{id}` | Stop and remove a camera |
+| `GET` | `/cameras/{id}` | Single-camera info (resolution, fps, prefix, derived PVs) |
+| `GET` | `/cameras/{id}/stream` | MJPEG stream |
+| `GET` | `/cameras/{id}/snapshot` | One JPEG frame |
+| `GET` | `/cameras/{id}/snapshot.png` | One PNG frame |
+| `GET` | `/cameras/{id}/control` | `{exposure, gain}` from RBV PVs |
+| `PUT` | `/cameras/{id}/control` | Body `{exposure?: float, gain?: float}` → caput |
+
+### Legacy aliases (default camera)
+
+`/stream`, `/snapshot`, `/snapshot.png`, `/info` route to the camera named in
+`cameras.json`'s `default` field. Return `503` if no default is set.
+
+## Examples
+
+```bash
+# health & camera list
+curl http://192.168.1.50:8004/health | jq
+curl http://192.168.1.50:8004/cameras | jq
+
+# read & set exposure
+curl http://192.168.1.50:8004/cameras/basler1/control | jq
+curl -X PUT -H 'Content-Type: application/json' \
+  -d '{"exposure":0.05,"gain":1.0}' \
+  http://192.168.1.50:8004/cameras/basler1/control | jq
+
+# snapshot & stream
+curl -o b1.jpg http://192.168.1.50:8004/cameras/basler1/snapshot
+# open in browser:
+# http://192.168.1.50:8004/cameras/gige1/stream
+
+# add a camera at runtime
+curl -X POST -H 'Content-Type: application/json' \
+  -d '{"id":"gige2","label":"Basler GigE 2","type":"gige","prefix":"gige2:","fps":12,"width":640,"height":480}' \
+  http://192.168.1.50:8004/cameras
+
+# remove
+curl -X DELETE http://192.168.1.50:8004/cameras/gige2
+```
+
+## React integration
+
+The reference component is `CameraStreamer.jsx` in this repo. The active UI in
+the wider system is at `/opt/react-ui/src/components/CameraView.tsx`, which
+still uses the legacy single-camera endpoints — the alias routes keep it
+working.
+
+```jsx
+import CameraStreamer from './CameraStreamer';
+
+export default function App() {
+  return <CameraStreamer serverUrl="http://192.168.1.50:8004" />;
+}
+```
+
+The component fetches `/cameras` to populate a dropdown, streams from the
+selected camera, polls `/control` every 5 s, and writes new exposure/gain
+values via `PUT /control`.
+
+## Demo mode
+
+If `pyepics` is missing or no IOC is reachable, each `CameraStream` renders a
+gradient test pattern with the camera id printed on it. The server still
+serves snapshots and streams; control endpoints return `null` for RBV and
+reject `PUT` with `503`.
 
 ## Troubleshooting
 
-### "ffmpeg not found" Error
-
-Install FFmpeg:
-- **Ubuntu/Debian:** `sudo apt-get install ffmpeg`
-- **macOS:** `brew install ffmpeg`
-- **Windows:** Download from https://ffmpeg.org/download.html
-
-### EPICS Connection Issues
-
-**Verify PV names:**
-```bash
-caget BASLER:IMAGE
-caget BASLER:HEIGHT
-caget BASLER:WIDTH
-```
-
-**Check EPICS environment:**
-```bash
-echo $EPICS_BASE
-echo $EPICS_CA_ADDR_LIST
-```
-
-**Set EPICS environment:**
-```bash
-export EPICS_BASE=/opt/epics
-export EPICS_CA_ADDR_LIST=your_epics_host:5064
-```
-
-### No Video Stream
-
-1. Check server is running: `curl http://localhost:8004/health`
-2. Verify EPICS PVs are accessible: `caget YOUR:PV:NAME`
-3. Check firewall allows port 8004: `sudo ufw allow 8004`
-4. Review server logs for errors
-
-### Slow Stream / High CPU Usage
-
-- Reduce `STREAM_FPS` (try 8-10)
-- Reduce `OUTPUT_WIDTH` and `OUTPUT_HEIGHT`
-- Increase `STREAM_BITRATE` if bandwidth allows
-- Use `CODEC = "h265"` for better compression
-
-### CORS Errors in Browser
-
-The server includes CORS middleware. If you still encounter issues:
-
-1. Verify server is running with correct URL
-2. Check browser console for actual error messages
-3. Ensure `serverUrl` prop matches your server address
-
-## Performance Tuning
-
-### Network Bandwidth
-
-For remote/WAN access (limited bandwidth):
-```python
-STREAM_FPS = 8
-STREAM_BITRATE = "1M"
-OUTPUT_WIDTH = 480
-OUTPUT_HEIGHT = 360
-CODEC = "h265"  # Better compression
-```
-
-### Local Network (LAN)
-
-For high-quality local streaming:
-```python
-STREAM_FPS = 24
-STREAM_BITRATE = "4M"
-OUTPUT_WIDTH = 1280
-OUTPUT_HEIGHT = 960
-CODEC = "h264"  # Lower CPU usage
-```
-
-### CPU Optimization
-
-- Use `h264` codec for lower CPU usage
-- Set `preset = "ultrafast"` in encoder (already configured)
-- Reduce resolution if CPU usage is high
-
-## Security Considerations
-
-### Production Deployment
-
-For production use, consider:
-
-1. **Authentication:** Add authentication middleware to FastAPI
-   ```python
-   from fastapi.security import HTTPBearer
-   security = HTTPBearer()
-
-   @app.get("/stream")
-   async def stream_video(credentials: HTTPAuthCredentials = Depends(security)):
-       # Verify credentials
-   ```
-
-2. **HTTPS:** Use a reverse proxy (nginx, Apache) with SSL/TLS
-
-3. **Rate Limiting:** Add rate limiting middleware
-   ```python
-   from slowapi import Limiter
-   limiter = Limiter(key_func=get_remote_address)
-   ```
-
-4. **Firewall:** Restrict access to trusted networks
-   ```bash
-   sudo ufw allow from 192.168.1.0/24 to any port 8004
-   ```
-
-5. **EPICS:** Secure your EPICS IOC with firewall rules
-
-## License
-
-This project is provided as-is for use with EPICS IOCs.
-
-## Support
-
-For issues or feature requests:
-1. Check the Troubleshooting section above
-2. Review server logs: `tail -f /tmp/camera_server.log`
-3. Test with demo mode first
-4. Verify EPICS PVs are accessible
-
-## Changelog
-
-### v1.0.0 (Initial Release)
-- FastAPI server with MJPEG streaming
-- Snapshot capture endpoints
-- Health check and info endpoints
-- React component with live display
-- Demo mode for testing
-- H.264/H.265 encoding support ready
+- **No frames** — check the IOC: `caget basler1:image1:ArrayData` (or whichever prefix). Server logs `Camera <id> caget failed` at DEBUG level.
+- **Bind error** — server picks the local IP on `CAMERA_SERVER_SUBNET` (default `192.168.1.0/24`). If your interface is elsewhere, set `HOST=0.0.0.0` or change the subnet env var.
+- **Add returns 409** — id is already in use; pick a different one or `DELETE` first.
+- **GigE specifically** — make sure jumbo frames are enabled on the NIC (`sudo ip link set <iface> mtu 9000`) and socket buffers are bumped (`sudo sysctl -w net.core.rmem_max=33554432`).
