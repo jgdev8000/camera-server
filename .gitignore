@@ -1,0 +1,19 @@
+# Virtual environment
+camera-env/
+venv/
+.venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Logs / runtime
+*.log
+*.pid
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
