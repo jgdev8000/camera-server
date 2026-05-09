@@ -741,7 +741,7 @@ function createCard(c, grid) {
       </div>
       <span class="badge" data-role="status-badge">…</span>
     </div>
-    <a href="/view/${c.id}"><img class="stream" src="/cameras/${c.id}/stream" alt="${c.id}"></a>
+    <a href="/view/${c.id}"><img class="stream" data-role="thumb" src="/cameras/${c.id}/snapshot?t=${Date.now()}" alt="${c.id}"></a>
     <div class="row">
       <button class="btn-acq-off" data-role="acquire">…</button>
       <a class="btn btn-open" href="/view/${c.id}">Open live view ▶</a>
@@ -752,7 +752,14 @@ function createCard(c, grid) {
 
   refreshControl(c.id, card);
   setInterval(() => refreshControl(c.id, card), 5000);
+  setInterval(() => refreshThumb(c.id, card), 3000);
   return card;
+}
+
+function refreshThumb(id, card) {
+  if (document.hidden) return;  // don't poll snapshots in background tabs
+  const img = card.querySelector('[data-role="thumb"]');
+  if (img) img.src = `/cameras/${id}/snapshot?t=${Date.now()}`;
 }
 
 function updateCardStatus(card, c) {
