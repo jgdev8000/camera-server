@@ -12,9 +12,36 @@
     },
     {
       "id": "gige1",
-      "label": "Basler GigE 1 (acA1920-25gm)",
+      "label": "Basler GigE 1 (acA1920-25gm @ .125)",
       "type": "gige",
       "prefix": "gige1:",
+      "fps": 12,
+      "width": 640,
+      "height": 480
+    },
+    {
+      "id": "gige2",
+      "label": "Basler GigE 2 (acA1920-25gm @ .126)",
+      "type": "gige",
+      "prefix": "gige2:",
+      "fps": 12,
+      "width": 640,
+      "height": 480
+    },
+    {
+      "id": "gige3",
+      "label": "Basler GigE 3 (acA1920-25gm @ .127)",
+      "type": "gige",
+      "prefix": "gige3:",
+      "fps": 12,
+      "width": 640,
+      "height": 480
+    },
+    {
+      "id": "gige4",
+      "label": "Basler GigE 4 (acA1920-25gm @ .128)",
+      "type": "gige",
+      "prefix": "gige4:",
       "fps": 12,
       "width": 640,
       "height": 480
