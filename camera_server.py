@@ -98,6 +98,8 @@ class ControlUpdate(BaseModel):
 # ---------- camera stream ----------
 
 class CameraStream:
+    IDLE_GRACE_S = 5.0  # how long to wait after the last stream viewer leaves before stopping Acquire
+
     def __init__(self, cfg: CameraConfig):
         self.cfg = cfg
         self.running = False
@@ -109,6 +111,9 @@ class CameraStream:
         self._pv_y: Optional["PV"] = None
         self._pv_x: Optional["PV"] = None
         self._demo_thread: Optional[threading.Thread] = None
+        self._consumers = 0
+        self._consumer_lock = threading.Lock()
+        self._stop_timer: Optional[threading.Timer] = None
 
     def start(self) -> None:
         if self.running:
@@ -128,6 +133,10 @@ class CameraStream:
 
     def stop(self) -> None:
         self.running = False
+        with self._consumer_lock:
+            if self._stop_timer is not None:
+                self._stop_timer.cancel()
+                self._stop_timer = None
         for pv in (self._pv_image, self._pv_y, self._pv_x):
             if pv is not None:
                 try:
@@ -158,7 +167,7 @@ class CameraStream:
                 frame = np.uint8(frame)
             if frame.ndim == 2:
                 frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-            frame = cv2.resize(frame, (self.cfg.width, self.cfg.height))
+            # store at native resolution; resize happens at output time
             with self.lock:
                 self.current_frame = frame
                 self._last_live_frame_at = time.time()
@@ -188,6 +197,44 @@ class CameraStream:
         cv2.putText(frame, f"prefix={self.cfg.prefix}", (10, 60),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
         return frame
+
+    # ----- consumer ref-counting + auto Acquire on/off -----
+
+    def add_consumer(self) -> None:
+        with self._consumer_lock:
+            self._consumers += 1
+            if self._stop_timer is not None:
+                self._stop_timer.cancel()
+                self._stop_timer = None
+            if self._consumers == 1 and EPICS_AVAILABLE:
+                try:
+                    caput(self.cfg.pv("cam1:Acquire"), 1)
+                    logger.info("Camera %s: auto-Acquire on (consumer joined)", self.cfg.id)
+                except Exception as e:
+                    logger.error("Camera %s auto-acquire failed: %s", self.cfg.id, e)
+
+    def remove_consumer(self) -> None:
+        with self._consumer_lock:
+            self._consumers = max(0, self._consumers - 1)
+            if self._consumers == 0:
+                if self._stop_timer is not None:
+                    self._stop_timer.cancel()
+                t = threading.Timer(self.IDLE_GRACE_S, self._auto_stop)
+                t.daemon = True
+                self._stop_timer = t
+                t.start()
+
+    def _auto_stop(self) -> None:
+        with self._consumer_lock:
+            self._stop_timer = None
+            if self._consumers > 0 or not EPICS_AVAILABLE:
+                return
+            try:
+                caput(self.cfg.pv("cam1:Acquire"), 0)
+                logger.info("Camera %s: auto-Acquire off (idle %.0fs)",
+                            self.cfg.id, self.IDLE_GRACE_S)
+            except Exception as e:
+                logger.error("Camera %s auto-stop failed: %s", self.cfg.id, e)
 
     def get_frame(self) -> Optional[np.ndarray]:
         with self.lock:
@@ -378,28 +425,49 @@ app.add_middleware(
 )
 
 
-def _mjpeg_response(stream: CameraStream) -> StreamingResponse:
+def _resize_for_output(frame: np.ndarray, stream: CameraStream,
+                       w: Optional[int], h: Optional[int]) -> np.ndarray:
+    """Default to native resolution. Resize only when at least one of w/h is given;
+    use cfg defaults for whichever dim is missing."""
+    if w is None and h is None:
+        return frame
+    tgt_w = w if w is not None else stream.cfg.width
+    tgt_h = h if h is not None else stream.cfg.height
+    if frame.shape[1] == tgt_w and frame.shape[0] == tgt_h:
+        return frame
+    return cv2.resize(frame, (tgt_w, tgt_h))
+
+
+def _mjpeg_response(stream: CameraStream,
+                    w: Optional[int] = None, h: Optional[int] = None) -> StreamingResponse:
     async def gen():
-        last_seen = -1
-        while stream.running:
-            frame, last_seen = stream.get_frame_if_newer(last_seen)
-            if frame is None:
-                await asyncio.sleep(0.005)
-                continue
-            ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-            if ok:
-                yield (b"--frame\r\n"
-                       b"Content-Type: image/jpeg\r\n"
-                       b"Content-Length: " + str(len(buf)).encode() + b"\r\n\r\n"
-                       + buf.tobytes() + b"\r\n")
+        stream.add_consumer()
+        try:
+            last_seen = -1
+            while stream.running:
+                frame, last_seen = stream.get_frame_if_newer(last_seen)
+                if frame is None:
+                    await asyncio.sleep(0.005)
+                    continue
+                frame = _resize_for_output(frame, stream, w, h)
+                ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                if ok:
+                    yield (b"--frame\r\n"
+                           b"Content-Type: image/jpeg\r\n"
+                           b"Content-Length: " + str(len(buf)).encode() + b"\r\n\r\n"
+                           + buf.tobytes() + b"\r\n")
+        finally:
+            stream.remove_consumer()
 
     return StreamingResponse(gen(), media_type="multipart/x-mixed-replace; boundary=frame")
 
 
-def _snapshot_response(stream: CameraStream, ext: str) -> Response:
+def _snapshot_response(stream: CameraStream, ext: str,
+                       w: Optional[int] = None, h: Optional[int] = None) -> Response:
     frame = stream.get_frame()
     if frame is None:
         raise HTTPException(status_code=503, detail="camera not ready")
+    frame = _resize_for_output(frame, stream, w, h)
     ok, buf = cv2.imencode(f".{ext}", frame,
                            [cv2.IMWRITE_JPEG_QUALITY, 95] if ext == "jpg" else [])
     if not ok:
@@ -741,7 +809,7 @@ function createCard(c, grid) {
       </div>
       <span class="badge" data-role="status-badge">…</span>
     </div>
-    <a href="/view/${c.id}"><img class="stream" data-role="thumb" src="/cameras/${c.id}/snapshot?t=${Date.now()}" alt="${c.id}"></a>
+    <a href="/view/${c.id}"><img class="stream" data-role="thumb" src="/cameras/${c.id}/snapshot?w=480&h=360&t=${Date.now()}" alt="${c.id}"></a>
     <div class="row">
       <button class="btn-acq-off" data-role="acquire">…</button>
       <a class="btn btn-open" href="/view/${c.id}">Open live view ▶</a>
@@ -759,7 +827,7 @@ function createCard(c, grid) {
 function refreshThumb(id, card) {
   if (document.hidden) return;  // don't poll snapshots in background tabs
   const img = card.querySelector('[data-role="thumb"]');
-  if (img) img.src = `/cameras/${id}/snapshot?t=${Date.now()}`;
+  if (img) img.src = `/cameras/${id}/snapshot?w=480&h=360&t=${Date.now()}`;
 }
 
 function updateCardStatus(card, c) {
@@ -846,18 +914,18 @@ async def camera_info(camera_id: str):
 
 
 @app.get("/cameras/{camera_id}/stream")
-async def camera_stream(camera_id: str):
-    return _mjpeg_response(manager.get(camera_id))
+async def camera_stream(camera_id: str, w: Optional[int] = None, h: Optional[int] = None):
+    return _mjpeg_response(manager.get(camera_id), w, h)
 
 
 @app.get("/cameras/{camera_id}/snapshot")
-async def camera_snapshot(camera_id: str):
-    return _snapshot_response(manager.get(camera_id), "jpg")
+async def camera_snapshot(camera_id: str, w: Optional[int] = None, h: Optional[int] = None):
+    return _snapshot_response(manager.get(camera_id), "jpg", w, h)
 
 
 @app.get("/cameras/{camera_id}/snapshot.png")
-async def camera_snapshot_png(camera_id: str):
-    return _snapshot_response(manager.get(camera_id), "png")
+async def camera_snapshot_png(camera_id: str, w: Optional[int] = None, h: Optional[int] = None):
+    return _snapshot_response(manager.get(camera_id), "png", w, h)
 
 
 @app.get("/cameras/{camera_id}/control")
@@ -877,18 +945,18 @@ async def put_control(camera_id: str, update: ControlUpdate):
 # ---------- legacy aliases (default camera) ----------
 
 @app.get("/stream")
-async def legacy_stream():
-    return _mjpeg_response(manager.get_default())
+async def legacy_stream(w: Optional[int] = None, h: Optional[int] = None):
+    return _mjpeg_response(manager.get_default(), w, h)
 
 
 @app.get("/snapshot")
-async def legacy_snapshot():
-    return _snapshot_response(manager.get_default(), "jpg")
+async def legacy_snapshot(w: Optional[int] = None, h: Optional[int] = None):
+    return _snapshot_response(manager.get_default(), "jpg", w, h)
 
 
 @app.get("/snapshot.png")
-async def legacy_snapshot_png():
-    return _snapshot_response(manager.get_default(), "png")
+async def legacy_snapshot_png(w: Optional[int] = None, h: Optional[int] = None):
+    return _snapshot_response(manager.get_default(), "png", w, h)
 
 
 @app.get("/info")
